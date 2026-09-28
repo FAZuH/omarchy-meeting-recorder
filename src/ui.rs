@@ -450,6 +450,7 @@ impl Recorder {
             .title("Language")
             .subtitle(RECORD_LANGUAGE)
             .enable_search(true)
+            .expression(gtk::StringObject::this_expression("string"))
             .model(&gtk::StringList::new(&language_labels))
             .build();
         let saved = settings::load_language();
@@ -654,6 +655,7 @@ impl Recorder {
             .title("Language")
             .subtitle("Transcribe again")
             .enable_search(true)
+            .expression(gtk::StringObject::this_expression("string"))
             .model(&gtk::StringList::new(&language_labels))
             .selected(language_row.selected())
             .build();
@@ -1678,6 +1680,7 @@ impl Recorder {
         let language = adw::ComboRow::builder()
             .title("Language")
             .enable_search(true)
+            .expression(gtk::StringObject::this_expression("string"))
             .model(&gtk::StringList::new(&language_labels))
             .selected(self.language_row.selected())
             .build();
