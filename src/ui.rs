@@ -1784,10 +1784,74 @@ impl Recorder {
             .map(|s| s.to_string())
             .unwrap_or_default();
         let length = format_elapsed(raw_duration(&staging));
+        match note
+            .as_ref()
+            .and_then(|note| saved_meeting(&config::output_dir(), note))
+        {
+            // The audio is a meeting already; only the transcript is missing, and
+            // the meeting's own control does that.
+            Some(meeting) => self.offer_saved_meeting(meeting, &when, &length),
+            None => self.offer_to_save(staging, note, &when, &length),
+        }
+    }
+
+    /// The audio of this orphan is already a meeting, so there is nothing to
+    /// save: only where to go next.
+    fn offer_saved_meeting(self: &Rc<Self>, dir: PathBuf, when: &str, length: &str) {
+        let manifest = meeting::find(&dir);
+        let stored = manifest.as_deref().and_then(|file| meeting::open(file));
+        let title = meeting_title(stored.as_ref().map(|(_, m)| m), &dir);
+        let partial = stored.as_ref().is_some_and(|(_, m)| m.partial);
+        let head = format!(
+            "A recording from {when} ({length}) is already saved as \u{201c}{title}\u{201d}."
+        );
+        let body = match what_is_left(partial, dir.join("transcript.md").exists()) {
+            WhatIsLeft::Partial => {
+                format!(
+                    "{head} Its transcript stops partway: open the meeting and choose Finish the transcript to get the rest."
+                )
+            }
+            WhatIsLeft::NoTranscript => {
+                format!(
+                    "{head} Only the transcript is missing: open the meeting and transcribe it to get the rest."
+                )
+            }
+            WhatIsLeft::Nothing => {
+                format!(
+                    "{head} It has its transcript and all, so there is nothing left to recover."
+                )
+            }
+        };
+        let dialog = adw::AlertDialog::new(Some("This recording is already saved"), Some(&body));
+        dialog.add_response("later", "Later");
+        dialog.add_response("open", "Open the meeting");
+        dialog.set_response_appearance("open", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("open"));
+        dialog.set_close_response("later");
+        let this = self.clone();
+        dialog.connect_response(None, move |_, response| {
+            if response == "open"
+                && let Some(manifest) = &manifest
+            {
+                this.open_meeting(manifest);
+            }
+        });
+        dialog.present(Some(&self.window));
+    }
+
+    /// Asks whether to save a recording that was never stopped, saying what
+    /// that costs.
+    fn offer_to_save(
+        self: &Rc<Self>,
+        staging: PathBuf,
+        note: Option<RecordingNote>,
+        when: &str,
+        length: &str,
+    ) {
         let dialog = adw::AlertDialog::new(
             Some("Unfinished recording found"),
             Some(&format!(
-                "A recording from {when} ({length}) was not stopped properly, probably because the app quit. Save it as a meeting?"
+                "A recording from {when} ({length}) was not stopped properly, probably because the app quit. Saving it writes the audio and transcribes the whole recording again, which takes a few minutes."
             )),
         );
         dialog.add_response("discard", "Discard");
@@ -1795,7 +1859,9 @@ impl Recorder {
         dialog.add_response("save", "Save");
         dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
         dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
-        dialog.set_default_response(Some("save"));
+        // Enter must not start a long job: the safe response is the default, as
+        // in every other dialog. Later leaves the audio, so this is asked again.
+        dialog.set_default_response(Some("later"));
         dialog.set_close_response("later");
         let this = self.clone();
         dialog.connect_response(None, move |_, response| match response {
@@ -3571,6 +3637,50 @@ fn read_recording_note(staging: &std::path::Path) -> Option<RecordingNote> {
     })
 }
 
+/// What a meeting the orphan's audio belongs to is still missing. A partial
+/// transcript is a file like any other, so only the manifest says so.
+#[derive(Debug, PartialEq)]
+enum WhatIsLeft {
+    Partial,
+    NoTranscript,
+    Nothing,
+}
+
+fn what_is_left(partial: bool, has_transcript: bool) -> WhatIsLeft {
+    match (partial, has_transcript) {
+        (true, _) => WhatIsLeft::Partial,
+        (false, false) => WhatIsLeft::NoTranscript,
+        (false, true) => WhatIsLeft::Nothing,
+    }
+}
+
+/// The name to call a meeting by: the one the user gave it, not the one the
+/// filesystem forced on its folder, which rewrites `/ \ : * ? " < > |`.
+fn meeting_title(stored: Option<&Manifest>, dir: &std::path::Path) -> String {
+    stored
+        .map(|m| m.title.as_str())
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            dir.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        })
+}
+
+/// Where a meeting of `note` belongs, under `root`.
+fn meeting_dir_for(root: &std::path::Path, note: &RecordingNote) -> PathBuf {
+    root.join(folder_name(note.started_at, &note.title))
+}
+
+/// Whether that meeting is already on disk: its manifest is what makes one. The
+/// folder alone is not enough, and `open` must not be asked, because it takes
+/// any folder named like a meeting.
+fn saved_meeting(root: &std::path::Path, note: &RecordingNote) -> Option<PathBuf> {
+    let dir = meeting_dir_for(root, note);
+    meeting::find(&dir).map(|_| dir)
+}
+
 /// Recording staging folders left behind, with some audio in them.
 fn unfinished_recordings() -> Vec<PathBuf> {
     let root = glib::user_cache_dir().join(APP_NAME);
@@ -3838,6 +3948,60 @@ mod tests {
             duration_secs: 60,
             partial,
         }
+    }
+
+    #[test]
+    fn a_meeting_is_named_by_its_title_not_by_its_folder() {
+        let dir = std::env::temp_dir().join(format!("omr-recovery-title-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("Weekly.meeting-recorder");
+        std::fs::write(
+            &file,
+            r#"{"title":"Q3/Q4 review","started_at":0,"partial":true}"#,
+        )
+        .unwrap();
+        let (_, manifest) = meeting::open(&file).unwrap();
+        // The title keeps its slash; the folder cannot hold one.
+        assert_eq!(meeting_title(Some(&manifest), &dir), "Q3/Q4 review");
+        // Nothing to read it from: the folder name, stamp and all.
+        assert_eq!(
+            meeting_title(None, &dir.join("202609241430 Q3-Q4 review")),
+            "202609241430 Q3-Q4 review"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_partial_meeting_is_not_a_finished_one_however_complete_it_looks() {
+        // The case that is easy to get wrong: a partial has a transcript.md too.
+        assert_eq!(what_is_left(true, true), WhatIsLeft::Partial);
+        assert_eq!(what_is_left(true, false), WhatIsLeft::Partial);
+        assert_eq!(what_is_left(false, false), WhatIsLeft::NoTranscript);
+        assert_eq!(what_is_left(false, true), WhatIsLeft::Nothing);
+    }
+
+    #[test]
+    fn a_meeting_counts_as_saved_only_with_its_manifest() {
+        let root = std::env::temp_dir().join(format!("omr-recovery-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let note = RecordingNote {
+            title: "Weekly".to_owned(),
+            started_at: 1_758_710_400,
+            format: Format::Mono,
+            language: "en".to_owned(),
+        };
+        assert!(saved_meeting(&root, &note).is_none());
+
+        let dir = meeting_dir_for(&root, &note);
+        assert!(dir.starts_with(&root));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A folder with the right name is not a meeting yet.
+        assert!(saved_meeting(&root, &note).is_none());
+
+        std::fs::write(dir.join("Weekly.meeting-recorder"), "{}").unwrap();
+        assert_eq!(saved_meeting(&root, &note), Some(dir));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
