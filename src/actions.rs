@@ -302,6 +302,7 @@ name = "not an action"
             model: None,
             chapters: Vec::new(),
             chapters_by: None,
+            partial: false,
         };
         let action = |command: &str| Action {
             name: "Test".into(),

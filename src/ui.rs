@@ -1376,6 +1376,11 @@ impl Recorder {
         }
     }
 
+    /// Whether this meeting's transcript stops where a cancelled run got to.
+    fn is_partial(&self) -> bool {
+        self.manifest.borrow().as_ref().is_some_and(|m| m.partial)
+    }
+
     /// The arrow keys seek only on the done page, with audio loaded, and never
     /// while a text field has focus: there they are the text cursor's.
     fn can_seek(&self) -> bool {
@@ -1473,11 +1478,19 @@ impl Recorder {
             let (mic, computer) = export::tracks(dir);
             (mic.is_file() && computer.is_file()) || source_track(dir).is_file()
         });
-        self.again_button.set_sensitive(tracks_kept);
-        self.again_button.set_tooltip_text(Some(if tracks_kept {
-            "Transcribe the meeting again with the selected language"
+        let partial = self.is_partial();
+        self.again_language_row.set_subtitle(if partial {
+            "Finish the transcript"
         } else {
-            "The separate tracks of this meeting are gone, so it cannot be transcribed again"
+            "Transcribe again"
+        });
+        self.again_button.set_sensitive(tracks_kept);
+        self.again_button.set_tooltip_text(Some(match (tracks_kept, partial) {
+            (false, _) => {
+                "The separate tracks of this meeting are gone, so it cannot be transcribed again"
+            }
+            (true, true) => "Finish the transcript with the selected language",
+            (true, false) => "Transcribe the meeting again with the selected language",
         }));
 
         let text = match state {
@@ -1720,6 +1733,7 @@ impl Recorder {
             model: None,
             chapters: Vec::new(),
             chapters_by: None,
+            partial: false,
         });
         self.animation_since.set(Some(std::time::Instant::now()));
         self.transcribing.reset();
@@ -2053,6 +2067,7 @@ impl Recorder {
                 model: None,
                 chapters: Vec::new(),
                 chapters_by: None,
+                partial: false,
             };
             let _ = meeting::write(&out, &manifest);
             *this.manifest.borrow_mut() = Some(manifest);
@@ -2115,6 +2130,7 @@ impl Recorder {
             let _ = events_tx.send_blocking(Event::Finished);
         });
 
+        let mut kept: Option<transcribe::Transcript> = None;
         while let Ok(event) = events_rx.recv().await {
             match event {
                 Event::Stage(stage) => self.transcribing.set_stage(&stage),
@@ -2139,6 +2155,7 @@ impl Recorder {
                     };
                     self.transcribing.push_text(&text);
                 }
+                Event::Partial(transcript) => kept = Some(transcript),
                 Event::Finished => break,
             }
         }
@@ -2148,13 +2165,21 @@ impl Recorder {
             .unwrap_or_else(|_| Err("transcription stopped unexpectedly".into()));
         *self.abort.borrow_mut() = None;
 
-        let transcript = result?;
+        // A cancelled transcription still keeps the sides it finished.
+        let transcript = match (result, kept) {
+            (Ok(transcript), _) => transcript,
+            (Err(_), Some(partial)) => partial,
+            (Err(e), None) => return Err(e),
+        };
         // The name as it is now; it may have been edited while transcribing.
         let out = self.result_dir.borrow().clone().unwrap_or(out);
         let date = glib::DateTime::from_unix_local(self.started_at.get())
             .and_then(|t| t.format("%Y-%m-%d %H:%M"))
             .map(|s| s.to_string())
             .unwrap_or_default();
+        if keeps_saved_partial(&transcript, out.join("transcript.md").exists()) {
+            return Ok(());
+        }
         let mut markdown = transcribe::to_markdown(&self.title(), &date, &transcript);
         if let Some(manifest) = self.manifest.borrow_mut().as_mut() {
             // An import finds its own number of speakers; keep names already
@@ -2221,6 +2246,7 @@ impl Recorder {
             manifest.language = language.to_owned();
             manifest.model = Some(crate::models::configured());
             manifest.title = self.title();
+            manifest.partial = transcript.partial;
             // Chapters of a previous transcript would point at lines that are gone.
             manifest.chapters.clear();
             manifest.chapters_by = None;
@@ -2241,7 +2267,8 @@ impl Recorder {
             && let Some(since) = since
         {
             let shown = since.elapsed();
-            let cancelled = matches!(result, Err(message) if message == CANCELLED);
+            let cancelled =
+                matches!(result, Err(message) if message == CANCELLED) || self.is_partial();
             if shown < MINIMUM && !cancelled && self.window.is_visible() {
                 self.transcribing.set_progress(1.0);
                 self.transcribing.set_stage("Done");
@@ -2280,8 +2307,9 @@ impl Recorder {
         } else {
             self.window.set_default_widget(Some(&self.copy_button));
             self.copy_button.grab_focus();
-            // A fresh transcript gets chapters when an agent is around.
-            if self.can_have_chapters() {
+            // A fresh transcript gets chapters when an agent is around; a
+            // partial one is a fraction of the meeting and not worth the call.
+            if !self.is_partial() && self.can_have_chapters() {
                 self.generate_chapters();
             }
         }
@@ -2395,13 +2423,14 @@ impl Recorder {
 
     /// Fills the done page from transcript.md: the meta line and the readable transcript.
     fn show_transcript(self: &Rc<Self>, markdown: Option<&str>, problem: Option<&str>) {
+        let partial = self.is_partial();
         let ok = problem.is_none() && markdown.is_some();
-        self.done_heading.set_label(if ok {
-            "Transcript ready"
-        } else {
-            "Meeting saved"
+        self.done_heading.set_label(match (partial, ok) {
+            (true, _) => "Transcript incomplete",
+            (false, true) => "Transcript ready",
+            (false, false) => "Meeting saved",
         });
-        self.done_icon.set_icon_name(Some(if ok {
+        self.done_icon.set_icon_name(Some(if ok && !partial {
             "object-select-symbolic"
         } else {
             "dialog-warning-symbolic"
@@ -3591,6 +3620,12 @@ fn clock_to_ms(clock: &str) -> i64 {
         * 1000
 }
 
+/// Whether a run that made nothing must leave the transcript already on disk
+/// alone: a second cancel must not wipe the first one's lines.
+fn keeps_saved_partial(transcript: &transcribe::Transcript, saved: bool) -> bool {
+    transcript.partial && transcript.segments.is_empty() && saved
+}
+
 /// Splits `**[01:23] You:** text` into its time, speaker and text.
 fn parse_segment(line: &str) -> Option<(&str, &str, &str)> {
     let rest = line.strip_prefix("**[")?;
@@ -3783,4 +3818,38 @@ fn meter_block(name: &str, meter: &gtk::DrawingArea) -> gtk::Box {
             .build(),
     );
     block
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(lines: usize, partial: bool) -> transcribe::Transcript {
+        transcribe::Transcript {
+            segments: (0..lines)
+                .map(|i| transcribe::Segment {
+                    start_ms: i as i64 * 1000,
+                    end_ms: i as i64 * 1000 + 500,
+                    speaker: "You".into(),
+                    text: "hello".into(),
+                })
+                .collect(),
+            language: "en".into(),
+            duration_secs: 60,
+            partial,
+        }
+    }
+
+    #[test]
+    fn a_second_cancel_leaves_the_first_partial_alone() {
+        // Nothing made, something already saved: the saved partial stands.
+        assert!(keeps_saved_partial(&run(0, true), true));
+        // Nothing saved yet: the first cancel has to write its own file.
+        assert!(!keeps_saved_partial(&run(0, true), false));
+        // A cancel that did make something is the better transcript.
+        assert!(!keeps_saved_partial(&run(3, true), true));
+        // A finished run always replaces it, empty or not.
+        assert!(!keeps_saved_partial(&run(3, false), true));
+        assert!(!keeps_saved_partial(&run(0, false), true));
+    }
 }

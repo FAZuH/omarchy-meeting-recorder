@@ -44,6 +44,9 @@ pub struct Manifest {
     pub chapters: Vec<Chapter>,
     /// Which agent made them, e.g. "claude".
     pub chapters_by: Option<String>,
+    /// This meeting's transcript is not complete: it stops where the
+    /// transcription was cancelled.
+    pub partial: bool,
 }
 
 impl Manifest {
@@ -65,6 +68,7 @@ impl Manifest {
                 .map(|c| json!({ "start_ms": c.start_ms, "title": c.title }))
                 .collect::<Vec<_>>(),
             "chapters_by": self.chapters_by,
+            "partial": self.partial,
         })
     }
 
@@ -113,6 +117,8 @@ impl Manifest {
                 })
                 .unwrap_or_default(),
             chapters_by: value["chapters_by"].as_str().map(str::to_owned),
+            // Meetings from before this field are complete ones.
+            partial: value["partial"].as_bool().unwrap_or(false),
         })
     }
 }
@@ -280,6 +286,7 @@ fn from_folder(dir: &Path) -> Option<Manifest> {
         model: None,
         chapters: Vec::new(),
         chapters_by: None,
+        partial: false,
     })
 }
 
@@ -301,9 +308,16 @@ mod tests {
 
         // No "YYYYMMDDHHMM title" in the name, so only the manifest can make
         // this one a meeting.
-        let (found, manifest) = open(&file).unwrap();
+        let (found, mut manifest) = open(&file).unwrap();
         assert_eq!(found, dir);
         assert_eq!(manifest.title, "Weekly");
+        // A manifest from before the field has it, so the meeting is complete.
+        assert!(!manifest.partial);
+
+        // What the app writes for a cancelled meeting reads back as partial.
+        manifest.partial = true;
+        let written = super::write(&found, &manifest).unwrap();
+        assert!(open(&written).unwrap().1.partial);
 
         let list = dir.join("shopping-list.txt");
         std::fs::write(&list, "milk\n").unwrap();

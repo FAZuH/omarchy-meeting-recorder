@@ -46,6 +46,9 @@ pub enum Event {
     Progress(f64),
     /// A freshly transcribed line.
     Segment(String),
+    /// The lines finished so far, sent once when a cancelled run gives up. The
+    /// app keeps them instead of losing the meeting.
+    Partial(Transcript),
     /// Always the last event. whisper-rs leaks the boxed callbacks that hold a
     /// sender, so the channel never closes on its own; wait for this instead.
     Finished,
@@ -65,11 +68,14 @@ pub struct Segment {
     pub text: String,
 }
 
+#[derive(Debug, Clone)]
 pub struct Transcript {
     pub segments: Vec<Segment>,
     /// The language used or detected, as a whisper code.
     pub language: String,
     pub duration_secs: i64,
+    /// Stopped before the end: the segments are the meeting so far.
+    pub partial: bool,
 }
 
 fn emit(events: &Events, event: Event) {
@@ -543,6 +549,7 @@ pub fn transcribe(
             language.to_owned()
         },
         duration_secs,
+        partial: false,
     };
     if is_silent(mic) && is_silent(computer) {
         emit(events, Event::Progress(1.0));
@@ -583,12 +590,13 @@ pub fn transcribe(
     let mut detected = None;
     let mut segments = Vec::new();
     let mut done = 0.0;
+    let mut cancelled = false;
     for (track, regions, speakers) in &sides {
         if regions.is_empty() {
             continue;
         }
         let share = length(regions) as f64 / total;
-        let (lines, found) = side_pass(
+        match side_pass(
             &context,
             track,
             regions,
@@ -598,18 +606,27 @@ pub fn transcribe(
             false,
             events,
             abort,
-        )?;
-        if language == "auto"
-            && let Some(found) = found
-        {
-            language = found.clone();
-            detected = Some(found);
+        ) {
+            Ok((lines, found)) => {
+                if language == "auto"
+                    && let Some(found) = found
+                {
+                    language = found.clone();
+                    detected = Some(found);
+                }
+                segments.extend(lines);
+                done += share;
+            }
+            // The sides that finished are the meeting so far, and the only
+            // lines with times on them: a side in flight has none yet.
+            Err(e) if e == CANCELLED => {
+                cancelled = true;
+                break;
+            }
+            Err(e) => return Err(e),
         }
-        segments.extend(lines);
-        done += share;
     }
-    emit(events, Event::Progress(1.0));
-    Ok(Transcript {
+    let transcript = Transcript {
         segments: interleave(segments),
         language: if language == "auto" {
             detected.unwrap_or_else(|| "unknown".into())
@@ -617,7 +634,14 @@ pub fn transcribe(
             language
         },
         duration_secs,
-    })
+        partial: cancelled,
+    };
+    if cancelled {
+        emit(events, Event::Partial(transcript));
+        return Err(CANCELLED.into());
+    }
+    emit(events, Event::Progress(1.0));
+    Ok(transcript)
 }
 
 /// The sentences of both sides in the order they were said, joined into
@@ -741,6 +765,7 @@ pub fn transcribe_single(
             language.to_owned()
         },
         duration_secs,
+        partial: false,
     };
     if is_silent(track) {
         emit(events, Event::Progress(1.0));
@@ -800,6 +825,7 @@ fn whisper_pass(
             language.to_owned()
         },
         duration_secs,
+        partial: false,
     })
 }
 
@@ -1239,8 +1265,11 @@ pub fn to_markdown(title: &str, date: &str, transcript: &Transcript) -> String {
         "- **Language:** {}\n\n",
         language_name(&transcript.language)
     );
+    if transcript.partial {
+        out += "_This transcript is incomplete: the transcription was cancelled. Finish it from the meeting's page._\n\n";
+    }
     out += "## Transcript\n\n";
-    if transcript.segments.is_empty() {
+    if transcript.segments.is_empty() && !transcript.partial {
         out += "_No speech was recognized._\n";
     }
     for segment in &transcript.segments {
@@ -1404,6 +1433,31 @@ mod tests {
                 "Sure, go ahead.",
                 "So the beta went out on Monday."
             ]
+        );
+    }
+
+    #[test]
+    fn a_partial_says_it_is_incomplete_and_never_claims_silence() {
+        let said = |partial| Transcript {
+            segments: vec![line(1000, "You", "Right, so the first thing is-")],
+            language: "en".into(),
+            duration_secs: 60,
+            partial,
+        };
+        assert!(to_markdown("Weekly", "2026-09-28", &said(true)).contains("incomplete"));
+        assert!(!to_markdown("Weekly", "2026-09-28", &said(false)).contains("incomplete"));
+
+        let empty = |partial| Transcript {
+            segments: Vec::new(),
+            language: "en".into(),
+            duration_secs: 60,
+            partial,
+        };
+        let quiet = to_markdown("Weekly", "2026-09-28", &empty(false));
+        assert!(quiet.contains("No speech was recognized."));
+        assert!(
+            !to_markdown("Weekly", "2026-09-28", &empty(true))
+                .contains("No speech was recognized.")
         );
     }
 
