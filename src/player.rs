@@ -351,6 +351,11 @@ impl Player {
         self.state.borrow().playback.is_some()
     }
 
+    /// Whether a meeting's audio is loaded, so there is something to seek in.
+    pub fn has_audio(&self) -> bool {
+        !self.state.borrow().files.is_empty()
+    }
+
     fn toggle(&self) {
         if self.is_playing() {
             self.pause();
@@ -393,6 +398,16 @@ impl Player {
     pub fn play_from(&self, ms: i64) {
         self.state.borrow_mut().paused_at_us = (ms * 1000).max(0);
         self.play();
+    }
+
+    /// Jumps `secs` from where the playhead is, as the arrow keys do. A jump
+    /// that would land at or past the end stops there instead of rewinding, which
+    /// is what playing on from the end of a meeting does.
+    pub fn skip(&self, secs: i64) {
+        if self.is_playing() && self.position_us() + secs * 1_000_000 >= self.duration_us() {
+            self.pause();
+        }
+        self.seek(skip_to_us(self.position_us(), self.duration_us(), secs));
     }
 
     fn seek(&self, us: i64) {
@@ -562,5 +577,25 @@ fn clock(secs: i64) -> String {
         format!("{h}:{m:02}:{s:02}")
     } else {
         format!("{m:02}:{s:02}")
+    }
+}
+
+/// Where `secs` from `position_us` lands, stopping at either end.
+fn skip_to_us(position_us: i64, duration_us: i64, secs: i64) -> i64 {
+    (position_us + secs * 1_000_000).clamp(0, duration_us.max(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FIVE: i64 = 5 * 1_000_000;
+
+    #[test]
+    fn skipping_moves_five_seconds_each_way() {
+        let minute = 60 * 1_000_000;
+        let meeting = 10 * minute;
+        assert_eq!(skip_to_us(minute, meeting, 5), minute + FIVE);
+        assert_eq!(skip_to_us(minute, meeting, -5), minute - FIVE);
     }
 }

@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use adw::prelude::*;
+use glib::prelude::Cast;
 use gtk::{gio, glib};
 
 use crate::agent::{self, Agent};
@@ -295,6 +296,8 @@ struct Recorder {
     toasts: adw::ToastOverlay,
     layout: gtk::Stack,
     compact_action: gio::SimpleAction,
+    seek_back: gio::SimpleAction,
+    seek_forward: gio::SimpleAction,
     compact_button: gtk::Button,
     cancel_button: gtk::Button,
     title_row: adw::EntryRow,
@@ -771,6 +774,12 @@ impl Recorder {
         window.add_action(&compact_action);
         let run_action = gio::SimpleAction::new("run-action", Some(glib::VariantTy::INT32));
         window.add_action(&run_action);
+        let seek_back = gio::SimpleAction::new("seek-back", None);
+        window.add_action(&seek_back);
+        let seek_forward = gio::SimpleAction::new("seek-forward", None);
+        window.add_action(&seek_forward);
+        app.set_accels_for_action("win.seek-back", &["Left"]);
+        app.set_accels_for_action("win.seek-forward", &["Right"]);
 
         let recorder = Rc::new(Recorder {
             window,
@@ -778,6 +787,8 @@ impl Recorder {
             toasts,
             layout,
             compact_action,
+            seek_back,
+            seek_forward,
             compact_button,
             cancel_button,
             title_row,
@@ -1039,6 +1050,17 @@ impl Recorder {
                 r.highlight(ms);
             }
         });
+
+        for (action, secs) in [(&self.seek_back, -5), (&self.seek_forward, 5)] {
+            let weak = Rc::downgrade(self);
+            action.connect_activate(move |_, _| {
+                if let Some(r) = weak.upgrade()
+                    && r.can_seek()
+                {
+                    r.player.skip(secs);
+                }
+            });
+        }
 
         let weak = Rc::downgrade(self);
         self.chapters_list.connect_row_activated(move |_, row| {
@@ -1335,6 +1357,15 @@ impl Recorder {
         if let Ok(text) = std::fs::read_to_string(dir.join("transcript.md")) {
             self.redraw_transcript(&text);
         }
+    }
+
+    /// The arrow keys seek only on the done page, with audio loaded, and never
+    /// while a text field has focus: there they are the text cursor's.
+    fn can_seek(&self) -> bool {
+        let typing = gtk::prelude::GtkWindowExt::focus(&self.window).is_some_and(|w| {
+            w.is::<gtk::TextView>() || w.is::<gtk::Text>() || w.is::<gtk::Entry>()
+        });
+        self.state.get() == State::Done && self.player.has_audio() && !typing
     }
 
     fn toast(&self, message: &str) {
