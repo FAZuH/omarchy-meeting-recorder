@@ -295,6 +295,7 @@ struct Recorder {
     layout: gtk::Stack,
     compact_action: gio::SimpleAction,
     compact_button: gtk::Button,
+    cancel_button: gtk::Button,
     title_row: adw::EntryRow,
     format_row: adw::ComboRow,
     language_row: adw::ComboRow,
@@ -399,6 +400,12 @@ impl Recorder {
             .action_name("win.compact")
             .build();
         header.pack_start(&compact_button);
+        let cancel_button = gtk::Button::builder()
+            .label("Cancel")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .build();
+        header.pack_end(&cancel_button);
         view.add_top_bar(&header);
         // Under the header bar, full width, while the speech model still has
         // to be downloaded.
@@ -770,6 +777,7 @@ impl Recorder {
             layout,
             compact_action,
             compact_button,
+            cancel_button,
             title_row,
             format_row,
             language_row,
@@ -921,6 +929,13 @@ impl Recorder {
                     this.confirm_import(path);
                 }
             });
+        });
+
+        let weak = Rc::downgrade(self);
+        self.cancel_button.connect_clicked(move |_| {
+            if let Some(r) = weak.upgrade() {
+                r.cancel_transcription();
+            }
         });
 
         let weak = Rc::downgrade(self);
@@ -1377,6 +1392,7 @@ impl Recorder {
         self.live.set(recording);
         self.dot.set_visible(recording);
         self.compact_button.set_visible(recording);
+        self.cancel_button.set_visible(state == State::Transcribing);
         self.compact_action.set_enabled(recording);
         self.language_row
             .set_sensitive(!matches!(state, State::Stopping | State::Transcribing));
@@ -3085,6 +3101,13 @@ impl Recorder {
         self.toast("Saved");
     }
 
+    /// Cancelling keeps the audio and the meeting folder; the run ends as `CANCELLED`.
+    fn cancel_transcription(&self) {
+        if let Some(abort) = self.abort.borrow().as_ref() {
+            abort.store(true, Ordering::Relaxed);
+        }
+    }
+
     fn close_when_done(&self) {
         self.quit_when_done.set(true);
         self.window.set_visible(false);
@@ -3127,9 +3150,7 @@ impl Recorder {
         dialog.connect_response(None, move |_, response| match response {
             "later" => this.close_when_done(),
             "cancel" => {
-                if let Some(abort) = this.abort.borrow().as_ref() {
-                    abort.store(true, Ordering::Relaxed);
-                }
+                this.cancel_transcription();
                 this.close_when_done();
             }
             _ => {}
