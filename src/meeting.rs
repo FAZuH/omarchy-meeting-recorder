@@ -13,6 +13,8 @@ use crate::chapters::Chapter;
 use crate::export::Format;
 
 pub const EXTENSION: &str = "meeting-recorder";
+/// What the app's shared-mime-info gives a meeting, for a chooser to match on.
+pub const MIME: &str = "application/x-omarchy-meeting";
 pub const DEFAULT_YOU: &str = "You";
 pub const DEFAULT_REMOTE: &str = "Remote";
 
@@ -283,7 +285,40 @@ fn from_folder(dir: &Path) -> Option<Manifest> {
 
 #[cfg(test)]
 mod tests {
-    use super::{relabel, side_of};
+    use super::{open, relabel, side_of};
+
+    #[test]
+    fn a_manifest_opens_and_anything_else_does_not() {
+        let dir = std::env::temp_dir().join(format!("omr-meeting-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("Weekly.meeting-recorder");
+        std::fs::write(
+            &file,
+            r#"{"app":"omarchy-meeting-recorder","title":"Weekly","started_at":1758710400}"#,
+        )
+        .unwrap();
+
+        // No "YYYYMMDDHHMM title" in the name, so only the manifest can make
+        // this one a meeting.
+        let (found, manifest) = open(&file).unwrap();
+        assert_eq!(found, dir);
+        assert_eq!(manifest.title, "Weekly");
+
+        let list = dir.join("shopping-list.txt");
+        std::fs::write(&list, "milk\n").unwrap();
+        assert!(open(&list).is_none());
+
+        // A stray file in a meeting-shaped folder opens that folder rather than
+        // being refused: from_folder takes any such folder for a meeting.
+        let standup = dir.join("202609241400 Standup");
+        std::fs::create_dir_all(&standup).unwrap();
+        let stray = standup.join("shopping-list.txt");
+        std::fs::write(&stray, "milk\n").unwrap();
+        assert_eq!(open(&stray).map(|(dir, _)| dir), Some(standup));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn labels_tell_the_side_and_number() {

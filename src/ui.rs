@@ -305,6 +305,7 @@ struct Recorder {
     language_row: adw::ComboRow,
     folder_row: adw::ActionRow,
     folder_button: gtk::Button,
+    open_meeting_button: gtk::Button,
     transcribing: Transcribing,
     meters: [gtk::DrawingArea; 2],
     compact_meters: [gtk::DrawingArea; 2],
@@ -465,6 +466,14 @@ impl Recorder {
             .build();
         folder_row.add_suffix(&folder_button);
         group.add(&folder_row);
+        let open_row = adw::ActionRow::builder().title("Open a meeting").build();
+        let open_meeting_button = gtk::Button::builder()
+            .label("Open…")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .build();
+        open_row.add_suffix(&open_meeting_button);
+        group.add(&open_row);
         content.append(&group);
 
         let frozen: [Frozen; 2] = Default::default();
@@ -796,6 +805,7 @@ impl Recorder {
             language_row,
             folder_row,
             folder_button,
+            open_meeting_button,
             transcribing,
             meters,
             compact_meters,
@@ -942,6 +952,13 @@ impl Recorder {
                     this.confirm_import(path);
                 }
             });
+        });
+
+        let weak = Rc::downgrade(self);
+        self.open_meeting_button.connect_clicked(move |_| {
+            if let Some(r) = weak.upgrade() {
+                r.choose_meeting();
+            }
         });
 
         let weak = Rc::downgrade(self);
@@ -2289,6 +2306,31 @@ impl Recorder {
                 app.quit();
             }
         }
+    }
+
+    /// Asks for a meeting and opens it, from the folder new ones go in.
+    fn choose_meeting(self: &Rc<Self>) {
+        let folder = config::output_dir();
+        // The chooser cannot start in a folder that is not there yet.
+        let _ = std::fs::create_dir_all(&folder);
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some("Meetings"));
+        filter.add_pattern(&format!("*.{}", meeting::EXTENSION));
+        filter.add_mime_type(meeting::MIME);
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&filter);
+        let mut dialog = gtk::FileDialog::builder().title("Your meetings");
+        // Only when it really is there: GTK falls back silently if it is not.
+        if folder.is_dir() {
+            dialog = dialog.initial_folder(&gio::File::for_path(&folder));
+        }
+        let dialog = dialog.filters(&filters).build();
+        let this = self.clone();
+        dialog.open(Some(&self.window), gio::Cancellable::NONE, move |result| {
+            if let Some(path) = result.ok().and_then(|f| f.path()) {
+                this.open_meeting(&path);
+            }
+        });
     }
 
     /// Shows a saved meeting on the done page, with the settings it was made with.
