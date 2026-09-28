@@ -125,7 +125,7 @@ If the app quits while it records (a crash, a logout, a power cut), the next sta
 
 ## What it writes to disk
 
-Every meeting is a plain folder in the meetings folder, named `<YYYYMMDDHHMM> <name>`, so they sort by date. The meetings folder is `~/Documents/Meetings` unless you move it (see [The model](#the-model)):
+Every meeting is a plain folder in the meetings folder, named `<YYYYMMDDHHMM> <name>`, so they sort by date. The meetings folder is `~/Documents/Meetings` unless you move it (see [The config file](#the-config-file)):
 
 ![Nautilus showing four meeting folders](screenshots/files-meetings.webp)
 
@@ -155,16 +155,19 @@ Both tracks are always recorded separately, and each is levelled to the same spe
 - **Crash recovery.** While recording, both tracks are written to a cache directory as they come in. A recording that was not stopped properly is still there on the next start.
 - **The bar widget.** The app serves its live state on a Unix socket in `$XDG_RUNTIME_DIR`. `omarchy-meeting-recorder watch` relays it as NDJSON, which is what the widget reads.
 
-### The model
+### The config file
 
-The default is whisper's `large-v3-turbo`. To use another, set it in `~/.config/omarchy-meeting-recorder/config.toml`:
+`~/.config/omarchy-meeting-recorder/config.toml` is where the app is told what to do. The default is whisper's `large-v3-turbo`; to use another, set it there:
 
 ```toml
 model = "small"   # tiny, tiny.en, base, base.en, small, small.en, medium, medium.en, large-v3, large-v3-turbo, or a path to a .bin file
 output_dir = "/home/you/Meetings"   # where new meetings are saved; ~/Documents/Meetings by default
+plain_display = true   # a plain status page while transcribing, instead of the animation
 ```
 
 `output_dir` wants a full path, and a leading `~` or `~/` is understood. The ready page shows the folder it is using, with a **Choose…** button that writes the folder you pick straight back into this file, so the next meeting lands there without a restart. Meetings recorded earlier stay where they are, and nothing is moved. Keep `output_dir` at the top of the file, above any `[[action]]` table: a key below one belongs to that action. Leave it out and every meeting goes to `~/Documents/Meetings`, as before.
+
+`plain_display` takes `true` or `false`, and anything else counts as off. With it on, transcribing shows the stage, a progress bar and the lines as they come in, and the app stops redrawing the window on every frame, which is what makes the rest of the desktop stutter while a long meeting is transcribed. It is read when a window opens, so set it before you start or open a new window to see it. Leave it out and you get the animation, as before.
 
 The command-line `transcribe` and `transcribe-file` take `--model` instead. When the configured model is not on disk yet, the start screen says so, with its size, and a Download button:
 

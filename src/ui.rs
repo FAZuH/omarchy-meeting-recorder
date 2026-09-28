@@ -1,6 +1,7 @@
 //! The recorder window. It has one page per phase: recording (which can shrink
 //! to a compact strip with only the waves and the clock), transcribing (the
-//! animation, edge to edge) and done (the transcript and what to do with it).
+//! animation, or the plain display, edge to edge) and done (the transcript and
+//! what to do with it).
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -13,7 +14,6 @@ use adw::prelude::*;
 use gtk::{gio, glib};
 
 use crate::agent::{self, Agent};
-use crate::animation::TranscribeAnimation;
 use crate::audio::{HISTORY, Source, to_meter};
 use crate::chapters::{self, Chapter};
 use crate::config;
@@ -22,6 +22,7 @@ use crate::ipc::{self, SharedStatus, Status};
 use crate::meeting::{self, Manifest};
 use crate::player::Player;
 use crate::transcribe::{self, Abort, CANCELLED, Event, LANGUAGES};
+use crate::transcribing::Transcribing;
 use crate::{APP_ID, APP_NAME, settings};
 
 const MIC_COLOR: (f64, f64, f64) = (0.21, 0.52, 0.89);
@@ -301,7 +302,7 @@ struct Recorder {
     language_row: adw::ComboRow,
     folder_row: adw::ActionRow,
     folder_button: gtk::Button,
-    animation: TranscribeAnimation,
+    transcribing: Transcribing,
     meters: [gtk::DrawingArea; 2],
     compact_meters: [gtk::DrawingArea; 2],
     dot: gtk::Label,
@@ -521,8 +522,9 @@ impl Recorder {
             .build();
         content.append(&import_button);
 
-        // Transcribing: the animation fills the whole window.
-        let animation = TranscribeAnimation::new();
+        // Transcribing: the animation fills the whole window, or the plain
+        // display when the config asks for it.
+        let transcribing = Transcribing::new(config::plain_display());
 
         // Done: a wide page. Left the meeting and what to do with it, right the
         // player and the transcript.
@@ -752,7 +754,7 @@ impl Recorder {
             .transition_duration(250)
             .build();
         layout.add_named(&content, Some("record"));
-        layout.add_named(animation.widget(), Some("transcribing"));
+        layout.add_named(transcribing.page(), Some("transcribing"));
         layout.add_named(&done, Some("done"));
         layout.add_named(&compact, Some("compact"));
         let drop_hint = gtk::Label::builder()
@@ -783,7 +785,7 @@ impl Recorder {
             language_row,
             folder_row,
             folder_button,
-            animation,
+            transcribing,
             meters,
             compact_meters,
             dot,
@@ -1459,7 +1461,8 @@ impl Recorder {
         self.layout.set_visible_child_name(page);
         // Recording and transcribing share one size, so stopping does not jump.
         self.fit_window(if page == "done" { DONE_SIZE } else { FULL_SIZE });
-        let immersive = matches!(state, State::Stopping | State::Transcribing);
+        let immersive =
+            matches!(state, State::Stopping | State::Transcribing) && self.transcribing.animates();
         self.view.set_extend_content_to_top_edge(immersive);
         if immersive {
             self.window.add_css_class("immersive");
@@ -1671,9 +1674,9 @@ impl Recorder {
             chapters_by: None,
         });
         self.animation_since.set(Some(std::time::Instant::now()));
-        self.animation.reset();
-        self.animation.set_stage("Importing audio");
-        self.animation.set_running(true);
+        self.transcribing.reset();
+        self.transcribing.set_stage("Importing audio");
+        self.transcribing.set_running(true);
         self.set_state(State::Stopping);
 
         let this = self.clone();
@@ -1962,10 +1965,10 @@ impl Recorder {
             return;
         };
         self.set_compact(false);
-        // Straight to the animation: the waves would suggest it is still recording.
-        self.animation.reset();
-        self.animation.set_stage("Saving audio");
-        self.animation.set_running(true);
+        // Straight to the transcribing page: the waves would suggest it is still recording.
+        self.transcribing.reset();
+        self.transcribing.set_stage("Saving audio");
+        self.transcribing.set_running(true);
         self.set_state(State::Stopping);
 
         let format = self.selected_format();
@@ -2019,7 +2022,8 @@ impl Recorder {
         });
     }
 
-    /// Transcribes into `result_dir/transcript.md`, driving the animation.
+    /// Transcribes into `result_dir/transcript.md`, driving the transcribing
+    /// page.
     async fn run_transcription(
         &self,
         tracks: Tracks,
@@ -2033,10 +2037,10 @@ impl Recorder {
             self.animation_since.set(Some(std::time::Instant::now()));
         }
         self.set_state(State::Transcribing);
-        self.animation.reset();
-        self.animation.set_stage("Loading audio");
-        self.animation.set_progress(0.0);
-        self.animation.set_running(true);
+        self.transcribing.reset();
+        self.transcribing.set_stage("Loading audio");
+        self.transcribing.set_progress(0.0);
+        self.transcribing.set_running(true);
 
         let abort = Abort::default();
         *self.abort.borrow_mut() = Some(abort.clone());
@@ -2065,9 +2069,9 @@ impl Recorder {
 
         while let Ok(event) = events_rx.recv().await {
             match event {
-                Event::Stage(stage) => self.animation.set_stage(&stage),
+                Event::Stage(stage) => self.transcribing.set_stage(&stage),
                 Event::Progress(progress) => {
-                    self.animation.set_progress(progress);
+                    self.transcribing.set_progress(progress);
                     self.shared.lock().unwrap().progress = progress;
                 }
                 Event::Segment(text) => {
@@ -2085,7 +2089,7 @@ impl Recorder {
                         }
                         _ => text.clone(),
                     };
-                    self.animation.push_text(&text);
+                    self.transcribing.push_text(&text);
                 }
                 Event::Finished => break,
             }
@@ -2180,19 +2184,23 @@ impl Recorder {
 
     /// Keeps the animation on screen for at least ten seconds, also after a
     /// short recording, so it reads as a step rather than a flicker. Skipped
-    /// when it was cancelled or the window is already gone.
+    /// when it was cancelled or the window is already gone, and on the plain
+    /// display, which is not held on screen at all.
     async fn hold_animation(&self, result: &Result<(), String>) {
         const MINIMUM: Duration = Duration::from_secs(10);
-        if let Some(since) = self.animation_since.take() {
+        let since = self.animation_since.take();
+        if self.transcribing.animates()
+            && let Some(since) = since
+        {
             let shown = since.elapsed();
             let cancelled = matches!(result, Err(message) if message == CANCELLED);
             if shown < MINIMUM && !cancelled && self.window.is_visible() {
-                self.animation.set_progress(1.0);
-                self.animation.set_stage("Done");
+                self.transcribing.set_progress(1.0);
+                self.transcribing.set_stage("Done");
                 glib::timeout_future(MINIMUM - shown).await;
             }
         }
-        self.animation.set_running(false);
+        self.transcribing.set_running(false);
     }
 
     fn finished(self: &Rc<Self>, audio_ok: bool, transcript: Result<(), String>) {

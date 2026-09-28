@@ -1,4 +1,5 @@
-//! Where new meetings are saved: the `output_dir` key in the config file.
+//! Where meetings are saved and how the transcribing page looks: the
+//! `output_dir` and `plain_display` keys in the config file.
 
 use std::path::{Path, PathBuf};
 
@@ -13,7 +14,24 @@ fn default_dir() -> PathBuf {
 /// The folder new meetings go in, read every time: a change takes effect
 /// without a restart.
 pub fn output_dir() -> PathBuf {
-    resolve(&std::fs::read_to_string(config_file()).unwrap_or_default())
+    resolve(&config_text())
+}
+
+/// Whether the transcribing page shows the plain display instead of the
+/// animation, which repaints the whole window on every frame. Read once, when
+/// the window is built, because the page is stacked then: a change needs a new
+/// window. `true` in any casing turns it on; anything else, `false` included,
+/// leaves the animation.
+pub fn plain_display() -> bool {
+    plain_display_in(&config_text())
+}
+
+fn plain_display_in(text: &str) -> bool {
+    value(text, "plain_display").is_some_and(|value| value.eq_ignore_ascii_case("true"))
+}
+
+fn config_text() -> String {
+    std::fs::read_to_string(config_file()).unwrap_or_default()
 }
 
 /// Remembers `dir` as the folder for new meetings. The rest of the config file
@@ -157,6 +175,21 @@ mod tests {
                 .is_empty()
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_plain_display_is_off_unless_the_config_says_true() {
+        assert!(!plain_display_in(""));
+        assert!(!plain_display_in("model = \"small\"\n"));
+        assert!(!plain_display_in("plain_display = false\n"));
+        assert!(!plain_display_in("plain_display = \"\"\n"));
+        assert!(plain_display_in("plain_display = true\n"));
+        assert!(plain_display_in("plain_display = True\n"));
+        assert!(plain_display_in("plain_display = \"TRUE\"\n"));
+        assert!(plain_display_in(
+            "model = \"small\"\nplain_display = true\n"
+        ));
+        assert!(!plain_display_in("[[action]]\nplain_display = \"true\"\n"));
     }
 
     #[test]
