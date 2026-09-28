@@ -22,7 +22,7 @@ use crate::export::{self, Format, export_audio, export_tracks};
 use crate::ipc::{self, SharedStatus, Status};
 use crate::meeting::{self, Manifest};
 use crate::player::Player;
-use crate::transcribe::{self, Abort, CANCELLED, Event, LANGUAGES};
+use crate::transcribe::{self, Abort, CANCELLED, Event};
 use crate::transcribing::Transcribing;
 use crate::{APP_ID, APP_NAME, settings};
 
@@ -31,6 +31,8 @@ const SYSTEM_COLOR: (f64, f64, f64) = (0.90, 0.38, 0.0);
 const FULL_SIZE: (i32, i32) = (480, 700);
 const COMPACT_SIZE: (i32, i32) = (300, 84);
 const DONE_SIZE: (i32, i32) = (1100, 760);
+/// What the recording page's language row is for, said the same way every time.
+const RECORD_LANGUAGE: &str = "Used for the transcript after the call";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum State {
@@ -442,19 +444,16 @@ impl Recorder {
             .build();
         let saved = settings::load_format();
         format_row.set_selected(Format::ALL.iter().position(|f| *f == saved).unwrap_or(0) as u32);
-        let language_labels: Vec<&str> = LANGUAGES.iter().map(|(_, label)| *label).collect();
+        let languages = transcribe::languages();
+        let language_labels: Vec<&str> = languages.iter().map(|(_, l)| l.as_str()).collect();
         let language_row = adw::ComboRow::builder()
             .title("Language")
-            .subtitle("Used for the transcript after the call")
+            .subtitle(RECORD_LANGUAGE)
+            .enable_search(true)
             .model(&gtk::StringList::new(&language_labels))
             .build();
         let saved = settings::load_language();
-        language_row.set_selected(
-            LANGUAGES
-                .iter()
-                .position(|(code, _)| *code == saved)
-                .unwrap_or(0) as u32,
-        );
+        language_row.set_selected(row_for(&saved).unwrap_or(0) as u32);
         group.add(&title_row);
         group.add(&format_row);
         group.add(&language_row);
@@ -654,6 +653,7 @@ impl Recorder {
         let again_language_row = adw::ComboRow::builder()
             .title("Language")
             .subtitle("Transcribe again")
+            .enable_search(true)
             .model(&gtk::StringList::new(&language_labels))
             .selected(language_row.selected())
             .build();
@@ -1376,6 +1376,24 @@ impl Recorder {
         }
     }
 
+    /// The subtitle a language row carries: what the row is for, plus what a
+    /// meeting asks for that no row can be. The row stays on Auto-detect for
+    /// such a code — the re-transcription will use the dropdown — so saying so
+    /// is the whole point.
+    fn language_note(&self, purpose: &str) -> String {
+        let saved = self.manifest.borrow();
+        let asked = saved
+            .as_ref()
+            .map(|m| m.language.as_str())
+            .filter(|code| row_for(code).is_none());
+        match asked {
+            Some(code) => {
+                format!("{purpose} — the meeting asks for {code}, which is not in the list")
+            }
+            None => purpose.to_owned(),
+        }
+    }
+
     /// Whether this meeting's transcript stops where a cancelled run got to.
     fn is_partial(&self) -> bool {
         self.manifest.borrow().as_ref().is_some_and(|m| m.partial)
@@ -1402,10 +1420,7 @@ impl Recorder {
     }
 
     fn selected_language(&self) -> &'static str {
-        LANGUAGES
-            .get(self.language_row.selected() as usize)
-            .map(|(code, _)| *code)
-            .unwrap_or("auto")
+        selected_code(transcribe::languages(), self.language_row.selected())
     }
 
     fn title(&self) -> String {
@@ -1479,11 +1494,15 @@ impl Recorder {
             (mic.is_file() && computer.is_file()) || source_track(dir).is_file()
         });
         let partial = self.is_partial();
-        self.again_language_row.set_subtitle(if partial {
+        let purpose = if partial {
             "Finish the transcript"
         } else {
             "Transcribe again"
-        });
+        };
+        self.again_language_row
+            .set_subtitle(&self.language_note(purpose));
+        self.language_row
+            .set_subtitle(&self.language_note(RECORD_LANGUAGE));
         self.again_button.set_sensitive(tracks_kept);
         self.again_button.set_tooltip_text(Some(match (tracks_kept, partial) {
             (false, _) => {
@@ -1654,9 +1673,11 @@ impl Recorder {
             .unwrap_or_default();
         let dialog = adw::AlertDialog::new(Some("Import audio"), Some(&name));
         let group = adw::PreferencesGroup::new();
-        let language_labels: Vec<&str> = LANGUAGES.iter().map(|(_, label)| *label).collect();
+        let languages = transcribe::languages();
+        let language_labels: Vec<&str> = languages.iter().map(|(_, l)| l.as_str()).collect();
         let language = adw::ComboRow::builder()
             .title("Language")
+            .enable_search(true)
             .model(&gtk::StringList::new(&language_labels))
             .selected(self.language_row.selected())
             .build();
@@ -1678,10 +1699,7 @@ impl Recorder {
             if response != "import" {
                 return;
             }
-            let code = LANGUAGES
-                .get(language.selected() as usize)
-                .map(|(code, _)| *code)
-                .unwrap_or("auto");
+            let code = selected_code(languages, language.selected());
             let count = match speakers.selected() {
                 0 => None,
                 n => Some(n as usize),
@@ -1927,16 +1945,13 @@ impl Recorder {
             title: "Recovered recording".to_owned(),
             started_at: ipc::now() - raw_duration(&staging),
             format: settings::load_format(),
-            language: settings::load_language().to_owned(),
+            language: settings::load_language(),
         });
         self.title_row.set_text(&note.title);
         if let Some(i) = Format::ALL.iter().position(|f| *f == note.format) {
             self.format_row.set_selected(i as u32);
         }
-        if let Some(i) = LANGUAGES
-            .iter()
-            .position(|(code, _)| *code == note.language)
-        {
+        if let Some(i) = row_for(&note.language) {
             self.language_row.set_selected(i as u32);
         }
         self.started_at.set(note.started_at);
@@ -2461,10 +2476,7 @@ impl Recorder {
         if let Some(i) = Format::ALL.iter().position(|f| *f == manifest.format) {
             self.format_row.set_selected(i as u32);
         }
-        if let Some(i) = LANGUAGES
-            .iter()
-            .position(|(code, _)| *code == manifest.language)
-        {
+        if let Some(i) = row_for(&manifest.language) {
             self.language_row.set_selected(i as u32);
         }
         self.loading.set(false);
@@ -3637,6 +3649,23 @@ fn read_recording_note(staging: &std::path::Path) -> Option<RecordingNote> {
     })
 }
 
+/// Which dropdown row holds `code`, the one a meeting's saved language is
+/// restored to. `None` for a code the list has no row for, which is a meeting
+/// the app can show but must not transcribe as if it were a language.
+fn row_for(code: &str) -> Option<usize> {
+    transcribe::languages()
+        .iter()
+        .position(|(listed, _)| *listed == code)
+}
+
+/// The code behind a dropdown row, Auto-detect when the row is not one of ours.
+fn selected_code(languages: &[(&'static str, String)], row: u32) -> &'static str {
+    languages
+        .get(row as usize)
+        .map(|(code, _)| *code)
+        .unwrap_or("auto")
+}
+
 /// What a meeting the orphan's audio belongs to is still missing. A partial
 /// transcript is a file like any other, so only the manifest says so.
 #[derive(Debug, PartialEq)]
@@ -3948,6 +3977,22 @@ mod tests {
             duration_secs: 60,
             partial,
         }
+    }
+
+    #[test]
+    fn an_unknown_code_has_no_row_and_no_row_means_auto() {
+        assert_eq!(row_for("auto"), Some(0));
+        assert!(row_for("id").is_some());
+        // What a mistyped or hand-edited meeting carries: no row, so the row is
+        // left as it is and the meeting says so.
+        assert_eq!(row_for("indoneisa"), None);
+        assert_eq!(row_for(""), None);
+
+        assert!(transcribe::is_known(selected_code(
+            transcribe::languages(),
+            1
+        )));
+        assert_eq!(selected_code(transcribe::languages(), 9999), "auto");
     }
 
     #[test]

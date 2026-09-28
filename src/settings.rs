@@ -7,7 +7,7 @@ use gtk::glib;
 
 use crate::APP_NAME;
 use crate::export::Format;
-use crate::transcribe::LANGUAGES;
+use crate::transcribe;
 
 fn path() -> PathBuf {
     let state = std::env::var_os("XDG_STATE_HOME")
@@ -47,15 +47,15 @@ pub fn save_format(format: Format) {
     save("format", format.key());
 }
 
-/// A whisper language code from `LANGUAGES`, "auto" when unset or unknown.
-pub fn load_language() -> &'static str {
+/// The language to transcribe with: what was saved, when whisper accepts it.
+/// Anything else is Auto-detect, which is what an unset code gets too.
+pub fn load_language() -> String {
     let settings = load();
     let saved = settings["language"].as_str().unwrap_or("auto");
-    LANGUAGES
-        .iter()
-        .map(|(code, _)| *code)
-        .find(|code| *code == saved)
-        .unwrap_or("auto")
+    match transcribe::is_known(saved) {
+        true => saved.to_owned(),
+        false => "auto".to_owned(),
+    }
 }
 
 pub fn save_language(code: &str) {

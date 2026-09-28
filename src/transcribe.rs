@@ -12,6 +12,7 @@ use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -25,18 +26,57 @@ use crate::audio::{CHANNELS, RATE};
 
 pub const WHISPER_RATE: usize = 16_000;
 
-/// (code, label) in the order of the dropdown. "auto" lets whisper detect it.
-pub const LANGUAGES: [(&str, &str); 9] = [
-    ("auto", "Auto-detect"),
-    ("en", "English"),
-    ("nl", "Dutch"),
-    ("de", "German"),
-    ("fr", "French"),
-    ("es", "Spanish"),
-    ("it", "Italian"),
-    ("pt", "Portuguese"),
-    ("id", "Indonesian"),
-];
+/// Every language whisper can transcribe, Auto-detect first, then the rest by
+/// name. Asked of whisper rather than kept here: its table is the one the
+/// transcription itself looks the code up in. Built once — the language rows
+/// are matched to each other by index, so they must be looking at one list.
+pub fn languages() -> &'static [(&'static str, String)] {
+    &LANGUAGES
+}
+
+static LANGUAGES: LazyLock<Vec<(&'static str, String)>> = LazyLock::new(|| {
+    let mut named: Vec<(&str, String)> = (0..=whisper_rs::get_lang_max_id())
+        .filter_map(|id| {
+            Some((
+                whisper_rs::get_lang_str(id)?,
+                titled(whisper_rs::get_lang_str_full(id)?),
+            ))
+        })
+        .collect();
+    named.sort_by(|a, b| a.1.cmp(&b.1));
+    let mut out = vec![("auto", "Auto-detect".to_owned())];
+    out.extend(named);
+    out
+});
+
+/// Whether whisper would take this code. "auto" is how the app spells
+/// Auto-detect, which whisper means with id -1 — and it accepts -1 for *any*
+/// code it does not know, so a mistyped one is indistinguishable from
+/// Auto-detect once it gets there: a plausible transcript in the wrong
+/// language, and nothing to show for it. Asking whisper is the only way to tell
+/// the two apart, which is why this is the check rather than a non-empty one.
+pub fn is_known(code: &str) -> bool {
+    code == "auto" || whisper_rs::get_lang_id(code).is_some()
+}
+
+/// The one refusal, so the entries and the gate cannot drift apart. The entries
+/// call it after the paths that never need a language and before anything
+/// expensive, since a wrong code costs seconds to find out otherwise;
+/// `run_whisper` calls it again as the last point before whisper.
+fn known_language(language: &str) -> Result<(), String> {
+    match is_known(language) {
+        true => Ok(()),
+        false => Err(format!("{language} is not a language whisper knows")),
+    }
+}
+
+fn titled(name: &str) -> String {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .map(|c| c.to_uppercase().collect::<String>() + chars.as_str())
+        .unwrap_or_default()
+}
 
 /// What the transcription reports while it runs.
 #[derive(Debug, Clone)]
@@ -566,6 +606,7 @@ pub fn transcribe(
         emit(events, Event::Progress(1.0));
         return Ok(empty(language));
     }
+    known_language(language)?;
     // Several voices on one side are told apart: people sharing your mic, or
     // several people on the other end of the call. On the mic only your own
     // stretches count, so the other side leaking in is not taken for a person
@@ -777,6 +818,7 @@ pub fn transcribe_single(
         emit(events, Event::Progress(1.0));
         return Ok(empty());
     }
+    known_language(language)?;
     // Speakers first, so the live lines can already say who is talking.
     let turns = match speakers {
         Some(1) => crate::diarize::single(track),
@@ -896,6 +938,9 @@ fn run_whisper(
     events: &Events,
     abort: &Abort,
 ) -> Result<(Vec<Word>, Option<String>), String> {
+    // The last point before whisper, and the invariant the entries above only
+    // approximate: no language reaches it without having been asked about.
+    known_language(language)?;
     let mut state = context.create_state().map_err(|e| e.to_string())?;
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
@@ -1236,20 +1281,14 @@ fn clock(ms: i64) -> String {
 }
 
 fn language_name(code: &str) -> String {
-    LANGUAGES
+    languages()
         .iter()
         .find(|(c, _)| *c == code)
-        .map(|(_, label)| (*label).to_owned())
+        .map(|(_, label)| label.clone())
         .or_else(|| {
             whisper_rs::get_lang_id(code)
                 .and_then(whisper_rs::get_lang_str_full)
-                .map(|full| {
-                    let mut chars = full.chars();
-                    chars
-                        .next()
-                        .map(|c| c.to_uppercase().collect::<String>() + chars.as_str())
-                        .unwrap_or_default()
-                })
+                .map(titled)
         })
         .unwrap_or_else(|| code.to_owned())
 }
@@ -1397,10 +1436,13 @@ fn run_cli(work: impl FnOnce(&Events, &Abort) -> Result<Transcript, String>) -> 
 
 fn usage() -> glib::ExitCode {
     eprintln!(
-        "Usage: {APP_NAME} transcribe <mic> <computer> [--language auto|en|nl|...] [--model name]"
+        "Usage: {APP_NAME} transcribe <mic> <computer> [--language <code>|auto] [--model name]"
     );
     eprintln!(
-        "       {APP_NAME} transcribe-file <audio> [--speakers N] [--language auto|en|nl|...] [--model name]"
+        "       {APP_NAME} transcribe-file <audio> [--speakers N] [--language <code>|auto] [--model name]"
+    );
+    eprintln!(
+        "       <code> is a language whisper knows, or auto to detect it; the app's Language dropdown lists them"
     );
     glib::ExitCode::from(2)
 }
@@ -1416,6 +1458,60 @@ mod tests {
             speaker: speaker.into(),
             text: text.into(),
         }
+    }
+
+    #[test]
+    fn every_language_offered_is_one_whisper_accepts() {
+        let offered = languages();
+        // Every language it knows, and nothing else: the count is what makes a
+        // test that only loops over the list worth having.
+        assert_eq!(
+            offered.len(),
+            whisper_rs::get_lang_max_id() as usize + 2,
+            "expected every language plus Auto-detect"
+        );
+        assert_eq!(offered.first().map(|(code, _)| *code), Some("auto"));
+        assert!(offered.iter().any(|(code, _)| *code == "id"));
+        for (code, label) in offered {
+            assert!(
+                is_known(code),
+                "{code} ({label}) is not one whisper accepts"
+            );
+        }
+        // The count alone would not notice one code listed twice instead of
+        // another listed once.
+        let mut codes: Vec<&str> = offered.iter().map(|(code, _)| *code).collect();
+        let listed = codes.len();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), listed, "the list has a code twice");
+    }
+
+    #[test]
+    fn the_list_is_by_name_with_auto_detect_first() {
+        let offered = languages();
+        let names: Vec<&str> = offered[1..]
+            .iter()
+            .map(|(_, label)| label.as_str())
+            .collect();
+        let mut sorted = names.clone();
+        // A stable sort, like the one the list itself uses: two languages with
+        // one name would otherwise compare as equal in either order.
+        sorted.sort();
+        assert_eq!(names, sorted);
+        assert!(offered.iter().any(|(_, label)| label == "Indonesian"));
+    }
+
+    #[test]
+    fn a_typo_is_refused_rather_than_taken_for_auto_detect() {
+        // A code it does not know is Auto-detect to whisper, so only asking
+        // tells a typo from one.
+        assert!(is_known("auto"));
+        assert!(is_known("de"));
+        assert!(is_known("german"));
+        assert!(!is_known("indoneisa"));
+        assert!(!is_known(""));
+        assert!(!is_known("Auto-detect"));
     }
 
     #[test]

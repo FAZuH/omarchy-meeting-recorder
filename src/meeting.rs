@@ -24,7 +24,7 @@ pub struct Manifest {
     pub started_at: i64,
     pub duration_secs: i64,
     pub format: Format,
-    /// The language picked for the transcript: a code from `LANGUAGES`, or "auto".
+    /// The language picked for the transcript: a code whisper knows, or "auto".
     pub language: String,
     /// What the speakers are called, in the order of their default labels:
     /// for a recording [microphone, computer audio], for an imported file
