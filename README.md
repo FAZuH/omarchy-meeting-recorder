@@ -125,7 +125,7 @@ If the app quits while it records (a crash, a logout, a power cut), the next sta
 
 ## What it writes to disk
 
-Every meeting is a plain folder in `~/Documents/Meetings`, named `<YYYYMMDDHHMM> <name>`, so they sort by date:
+Every meeting is a plain folder in the meetings folder, named `<YYYYMMDDHHMM> <name>`, so they sort by date. The meetings folder is `~/Documents/Meetings` unless you move it (see [The model](#the-model)):
 
 ![Nautilus showing four meeting folders](screenshots/files-meetings.webp)
 
@@ -161,7 +161,10 @@ The default is whisper's `large-v3-turbo`. To use another, set it in `~/.config/
 
 ```toml
 model = "small"   # tiny, tiny.en, base, base.en, small, small.en, medium, medium.en, large-v3, large-v3-turbo, or a path to a .bin file
+output_dir = "/home/you/Meetings"   # where new meetings are saved; ~/Documents/Meetings by default
 ```
+
+`output_dir` wants a full path, and a leading `~` or `~/` is understood. The ready page shows the folder it is using, with a **Choose…** button that writes the folder you pick straight back into this file, so the next meeting lands there without a restart. Meetings recorded earlier stay where they are, and nothing is moved. Keep `output_dir` at the top of the file, above any `[[action]]` table: a key below one belongs to that action. Leave it out and every meeting goes to `~/Documents/Meetings`, as before.
 
 The command-line `transcribe` and `transcribe-file` take `--model` instead. When the configured model is not on disk yet, the start screen says so, with its size, and a Download button:
 

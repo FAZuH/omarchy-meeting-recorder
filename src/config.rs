@@ -1,0 +1,174 @@
+//! Where new meetings are saved: the `output_dir` key in the config file.
+
+use std::path::{Path, PathBuf};
+
+use gtk::glib;
+
+use crate::models::config_file;
+
+fn default_dir() -> PathBuf {
+    glib::home_dir().join("Documents/Meetings")
+}
+
+/// The folder new meetings go in, read every time: a change takes effect
+/// without a restart.
+pub fn output_dir() -> PathBuf {
+    resolve(&std::fs::read_to_string(config_file()).unwrap_or_default())
+}
+
+/// Remembers `dir` as the folder for new meetings. The rest of the config file
+/// is kept: models and actions live in it too.
+pub fn set_output_dir(dir: &Path) -> Result<(), String> {
+    if !dir.is_absolute() {
+        return Err("the folder has to be a full path".into());
+    }
+    let file = config_file();
+    let text = existing_text(&file)?;
+    let escaped = dir
+        .display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let updated = with_output_dir(&text, &format!("output_dir = \"{escaped}\""));
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&file, updated).map_err(|e| e.to_string())
+}
+
+/// The config file as it is, or nothing when there is none yet. Any other read
+/// error is reported: rewriting from an empty read would wipe what is in it.
+fn existing_text(file: &Path) -> Result<String, String> {
+    match std::fs::read_to_string(file) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn resolve(text: &str) -> PathBuf {
+    let home = glib::home_dir();
+    value(text, "output_dir")
+        .map(|value| {
+            if value == "~" {
+                home
+            } else if let Some(rest) = value.strip_prefix("~/") {
+                home.join(rest)
+            } else {
+                PathBuf::from(value)
+            }
+        })
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(default_dir)
+}
+
+fn with_output_dir(text: &str, line: &str) -> String {
+    let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    let top = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with('['))
+        .unwrap_or(lines.len());
+    match lines[..top].iter().position(|l| key(l) == "output_dir") {
+        Some(at) => lines[at] = line.to_owned(),
+        None => lines.insert(0, line.to_owned()),
+    }
+    format!("{}\n", lines.join("\n"))
+}
+
+fn key(line: &str) -> &str {
+    line.split_once('=').map_or("", |(key, _)| key.trim())
+}
+
+fn value(text: &str, wanted: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .take_while(|line| !line.starts_with('['))
+        .find_map(|line| {
+            let (found, rest) = line.split_once('=')?;
+            (found.trim() == wanted).then(|| crate::actions::unquote(rest.trim()))
+        })
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_configured_folder_wins() {
+        assert_eq!(
+            resolve("model = \"small\"\noutput_dir = \"/mnt/Meetings\"\n"),
+            PathBuf::from("/mnt/Meetings")
+        );
+        assert_eq!(
+            resolve("output_dir = \"/mnt/my#drive\""),
+            PathBuf::from("/mnt/my#drive")
+        );
+        assert_eq!(
+            resolve("output_dir = \"/data/my \\\"meetings\\\"\""),
+            PathBuf::from("/data/my \"meetings\"")
+        );
+    }
+
+    #[test]
+    fn a_tilde_is_the_home_directory() {
+        let home = glib::home_dir();
+        assert_eq!(
+            resolve("output_dir = \"~/Notes/Meetings\""),
+            home.join("Notes/Meetings")
+        );
+        assert_eq!(resolve("output_dir = \"~\""), home);
+    }
+
+    #[test]
+    fn an_unusable_value_falls_back_to_the_default() {
+        let default = default_dir();
+        assert_eq!(resolve(""), default);
+        assert_eq!(resolve("model = \"small\"\n"), default);
+        assert_eq!(resolve("output_dir = \"\"\n"), default);
+        assert_eq!(resolve("output_dir = \"Meetings\"\n"), default);
+        assert_eq!(resolve("output_dir = \"~root/Meetings\"\n"), default);
+    }
+
+    #[test]
+    fn an_action_field_is_not_the_meetings_folder() {
+        let text =
+            "[[action]]\nname = \"Send\"\ncommand = \"send.sh\"\noutput_dir = \"/tmp/action\"\n";
+        assert_eq!(resolve(text), default_dir());
+        let written = with_output_dir(text, "output_dir = \"/mnt/Meetings\"");
+        assert!(written.starts_with("output_dir = \"/mnt/Meetings\"\n[[action]]"));
+        assert!(written.contains("output_dir = \"/tmp/action\""));
+        assert_eq!(written.matches("output_dir").count(), 2);
+    }
+
+    #[test]
+    fn an_unreadable_config_is_reported_and_a_missing_one_is_not() {
+        let dir = std::env::temp_dir().join("omr-config-unreadable");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.toml");
+        let broken = b"model = \"small\"\nname = \"caf\xe9\"\n";
+        std::fs::write(&file, broken).unwrap();
+        assert!(existing_text(&file).is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), broken);
+        assert!(
+            existing_text(&dir.join("nothing-here.toml"))
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn setting_the_folder_keeps_the_rest_of_the_file() {
+        let file = "model = \"small\"\n\n[[action]]\nname = \"Send\"\ncommand = \"send.sh\"\n";
+        let written = with_output_dir(file, "output_dir = \"/mnt/Meetings\"");
+        assert!(written.starts_with("output_dir = \"/mnt/Meetings\"\nmodel = \"small\""));
+        assert!(written.contains("[[action]]\nname = \"Send\"\ncommand = \"send.sh\"\n"));
+        assert!(!written.contains("\n\noutput_dir"));
+
+        let again = with_output_dir(&written, "output_dir = \"/data/Meetings\"");
+        assert_eq!(again.matches("output_dir").count(), 1);
+        assert!(again.contains("output_dir = \"/data/Meetings\"\nmodel = \"small\""));
+    }
+}

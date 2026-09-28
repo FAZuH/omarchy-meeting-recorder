@@ -8,6 +8,7 @@ mod animation;
 mod audio;
 mod bar_widget;
 mod chapters;
+mod config;
 mod diarize;
 mod export;
 mod ipc;

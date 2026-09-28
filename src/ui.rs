@@ -16,6 +16,7 @@ use crate::agent::{self, Agent};
 use crate::animation::TranscribeAnimation;
 use crate::audio::{HISTORY, Source, to_meter};
 use crate::chapters::{self, Chapter};
+use crate::config;
 use crate::export::{self, Format, export_audio, export_tracks};
 use crate::ipc::{self, SharedStatus, Status};
 use crate::meeting::{self, Manifest};
@@ -297,6 +298,8 @@ struct Recorder {
     title_row: adw::EntryRow,
     format_row: adw::ComboRow,
     language_row: adw::ComboRow,
+    folder_row: adw::ActionRow,
+    folder_button: gtk::Button,
     animation: TranscribeAnimation,
     meters: [gtk::DrawingArea; 2],
     compact_meters: [gtk::DrawingArea; 2],
@@ -443,6 +446,14 @@ impl Recorder {
         group.add(&title_row);
         group.add(&format_row);
         group.add(&language_row);
+        let folder_row = adw::ActionRow::builder().title("Meetings folder").build();
+        let folder_button = gtk::Button::builder()
+            .label("Choose…")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .build();
+        folder_row.add_suffix(&folder_button);
+        group.add(&folder_row);
         content.append(&group);
 
         let frozen: [Frozen; 2] = Default::default();
@@ -762,6 +773,8 @@ impl Recorder {
             title_row,
             format_row,
             language_row,
+            folder_row,
+            folder_button,
             animation,
             meters,
             compact_meters,
@@ -906,6 +919,29 @@ impl Recorder {
             dialog.open(Some(&r.window), gio::Cancellable::NONE, move |result| {
                 if let Some(path) = result.ok().and_then(|f| f.path()) {
                     this.confirm_import(path);
+                }
+            });
+        });
+
+        let weak = Rc::downgrade(self);
+        self.folder_button.connect_clicked(move |_| {
+            let Some(r) = weak.upgrade() else { return };
+            let dialog = gtk::FileDialog::builder()
+                .title("Where meetings are saved")
+                .build();
+            let this = r.clone();
+            dialog.select_folder(Some(&r.window), gio::Cancellable::NONE, move |result| {
+                let Some(path) = result.ok().and_then(|folder| folder.path()) else {
+                    return;
+                };
+                match config::set_output_dir(&path) {
+                    Ok(()) => {
+                        this.show_output_dir();
+                        this.toast("New meetings go there");
+                    }
+                    Err(message) => {
+                        this.toast(&format!("Could not save the folder: {message}"));
+                    }
                 }
             });
         });
@@ -1335,6 +1371,7 @@ impl Recorder {
     }
 
     fn render(&self) {
+        self.show_output_dir();
         let state = self.state.get();
         let recording = state == State::Recording;
         self.live.set(recording);
@@ -1592,10 +1629,10 @@ impl Recorder {
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map_or_else(ipc::now, |d| d.as_secs() as i64);
-        let mut out = output_dir(started_at, &title);
+        let mut out = meeting_folder(started_at, &title);
         let mut n = 2;
         while out.exists() {
-            out = output_dir(started_at, &format!("{title} {n}"));
+            out = meeting_folder(started_at, &format!("{title} {n}"));
             n += 1;
         }
 
@@ -1765,6 +1802,11 @@ impl Recorder {
         self.stop();
     }
 
+    fn show_output_dir(&self) {
+        self.folder_row
+            .set_subtitle(&config::output_dir().display().to_string());
+    }
+
     /// Says so when the speech model is not on disk yet, with a button to get it.
     fn update_model_banner(&self) {
         if self.model_downloading.get() {
@@ -1912,7 +1954,7 @@ impl Recorder {
 
         let format = self.selected_format();
         let language = self.selected_language();
-        let out = output_dir(self.started_at.get(), &self.title());
+        let out = meeting_folder(self.started_at.get(), &self.title());
         let this = self.clone();
         glib::spawn_future_local(async move {
             let (audio_out, audio_staging) = (out.clone(), staging.clone());
@@ -2998,7 +3040,13 @@ impl Recorder {
             return;
         };
         let title = self.title();
-        let target = output_dir(self.started_at.get(), &title);
+        // A meeting from another folder keeps it when it is renamed: changing
+        // the folder is for new meetings, not for moving old ones.
+        let target = if current.parent() == Some(config::output_dir().as_path()) {
+            meeting_folder(self.started_at.get(), &title)
+        } else {
+            current.with_file_name(folder_name(self.started_at.get(), &title))
+        };
         // "202609241400 Weekly 2" is still the folder of "Weekly": an import
         // got a number when the name was taken. Only a new name renames.
         let renamed = !folder_is_for(&current, &target);
@@ -3107,14 +3155,16 @@ fn folder_is_for(folder: &std::path::Path, expected: &std::path::Path) -> bool {
         })
 }
 
-fn output_dir(started_at: i64, title: &str) -> PathBuf {
+fn meeting_folder(started_at: i64, title: &str) -> PathBuf {
+    config::output_dir().join(folder_name(started_at, title))
+}
+
+fn folder_name(started_at: i64, title: &str) -> String {
     let stamp = glib::DateTime::from_unix_local(started_at)
         .and_then(|t| t.format("%Y%m%d%H%M"))
         .map(|s| s.to_string())
         .unwrap_or_default();
-    glib::home_dir()
-        .join("Documents/Meetings")
-        .join(format!("{stamp} {}", safe_name(title)))
+    format!("{stamp} {}", safe_name(title))
 }
 
 fn row_count(list: &gtk::ListBox) -> i32 {

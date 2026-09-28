@@ -78,7 +78,7 @@ fn parse(text: &str) -> Vec<Action> {
 }
 
 /// A TOML string: `"..."` with backslash escapes, or `'...'` taken literally.
-fn unquote(value: &str) -> String {
+pub(crate) fn unquote(value: &str) -> String {
     if let Some(inner) = value.strip_prefix('\'').and_then(|v| v.split('\'').next()) {
         return inner.to_owned();
     }
