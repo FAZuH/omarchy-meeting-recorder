@@ -303,6 +303,9 @@ struct Recorder {
     compact_button: gtk::Button,
     cancel_button: gtk::Button,
     settings_button: gtk::Button,
+    settings_dialog: adw::PreferencesDialog,
+    folder_row: adw::ActionRow,
+    folder_button: gtk::Button,
     title_row: adw::EntryRow,
     format_row: adw::ComboRow,
     language_row: adw::ComboRow,
@@ -460,7 +463,6 @@ impl Recorder {
         let saved = settings::load_language();
         language_row.set_selected(row_for(&saved).unwrap_or(0) as u32);
         group.add(&title_row);
-        group.add(&format_row);
         group.add(&language_row);
         let open_row = adw::ActionRow::builder().title("Open a meeting").build();
         let open_meeting_button = gtk::Button::builder()
@@ -471,6 +473,27 @@ impl Recorder {
         open_row.add_suffix(&open_meeting_button);
         group.add(&open_row);
         content.append(&group);
+
+        // The settings page: built once, so format_row keeps the identity that
+        // start, stop, recovery and open-meeting all read through.
+        let settings_dialog = adw::PreferencesDialog::builder()
+            .title("Settings")
+            .search_enabled(false)
+            .build();
+        let folder_row = adw::ActionRow::builder().title("Meetings folder").build();
+        folder_row.set_subtitle(&config::output_dir().display().to_string());
+        let folder_button = gtk::Button::builder()
+            .label("Choose…")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .build();
+        folder_row.add_suffix(&folder_button);
+        let settings_group = adw::PreferencesGroup::new();
+        settings_group.add(&format_row);
+        settings_group.add(&folder_row);
+        let settings_page = adw::PreferencesPage::builder().title("Settings").build();
+        settings_page.add(&settings_group);
+        settings_dialog.add(&settings_page);
 
         let frozen: [Frozen; 2] = Default::default();
         let live: Rc<Cell<bool>> = Rc::default();
@@ -799,6 +822,9 @@ impl Recorder {
             compact_button,
             cancel_button,
             settings_button,
+            settings_dialog,
+            folder_row,
+            folder_button,
             title_row,
             format_row,
             language_row,
@@ -969,6 +995,13 @@ impl Recorder {
         self.settings_button.connect_clicked(move |_| {
             if let Some(r) = weak.upgrade() {
                 r.open_settings();
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.folder_button.connect_clicked(move |_| {
+            if let Some(r) = weak.upgrade() {
+                r.choose_folder(&r.settings_dialog, &r.folder_row);
             }
         });
 
@@ -1931,12 +1964,14 @@ impl Recorder {
             language: settings::load_language(),
         });
         self.title_row.set_text(&note.title);
+        self.loading.set(true);
         if let Some(i) = Format::ALL.iter().position(|f| *f == note.format) {
             self.format_row.set_selected(i as u32);
         }
         if let Some(i) = row_for(&note.language) {
             self.language_row.set_selected(i as u32);
         }
+        self.loading.set(false);
         self.started_at.set(note.started_at);
         self.paused.set(false);
         self.paused_secs.set(0);
@@ -1947,37 +1982,12 @@ impl Recorder {
         self.stop();
     }
 
-    /// The settings page, built fresh each time so it shows what is stored now.
+    /// The settings page, built once in `new`. Refreshes what can have gone
+    /// stale since it was last shown, then presents it.
     fn open_settings(self: &Rc<Self>) {
-        let dialog = adw::PreferencesDialog::builder()
-            .title("Settings")
-            .search_enabled(false)
-            .build();
-        let folder_row = adw::ActionRow::builder().title("Meetings folder").build();
-        folder_row.set_subtitle(&config::output_dir().display().to_string());
-        let folder_button = gtk::Button::builder()
-            .label("Choose…")
-            .valign(gtk::Align::Center)
-            .css_classes(["flat"])
-            .build();
-        folder_row.add_suffix(&folder_button);
-        let group = adw::PreferencesGroup::new();
-        group.add(&folder_row);
-        let page = adw::PreferencesPage::builder().title("Settings").build();
-        page.add(&group);
-        dialog.add(&page);
-
-        let weak = Rc::downgrade(self);
-        let sheet_weak = dialog.downgrade();
-        let row_weak = folder_row.downgrade();
-        folder_button.connect_clicked(move |_| {
-            if let Some(r) = weak.upgrade()
-                && let (Some(sheet), Some(row)) = (sheet_weak.upgrade(), row_weak.upgrade())
-            {
-                r.choose_folder(&sheet, &row);
-            }
-        });
-        dialog.present(Some(&self.window));
+        self.folder_row
+            .set_subtitle(&config::output_dir().display().to_string());
+        self.settings_dialog.present(Some(&self.window));
     }
 
     /// Asks for a folder and stores it as where meetings are saved.
