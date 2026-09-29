@@ -34,6 +34,7 @@ const DONE_SIZE: (i32, i32) = (1100, 760);
 /// What the recording page's language row is for, said the same way every time.
 const RECORD_LANGUAGE: &str =
     "For this meeting's transcript only; the default language lives in Settings";
+const IMPORT_LINE: &str = "Import an audio file, or drop one here";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum State {
@@ -564,11 +565,26 @@ impl Recorder {
         buttons.append(&pause_button);
         buttons.append(&button);
         content.append(&buttons);
+        let import_glyph = gtk::Image::builder()
+            .icon_name("folder-download-symbolic")
+            .pixel_size(32)
+            .halign(gtk::Align::Center)
+            .build();
+        let import_text = gtk::Label::new(Some(IMPORT_LINE));
+        let import_stack = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(4)
+            .halign(gtk::Align::Center)
+            .build();
+        import_stack.append(&import_glyph);
+        import_stack.append(&import_text);
         let import_button = gtk::Button::builder()
-            .label("Import an audio file, or drop one here")
             .halign(gtk::Align::Center)
             .css_classes(["flat"])
+            .child(&import_stack)
             .build();
+        // GTK names a button after its label child, so a custom child leaves it unnamed.
+        import_button.update_property(&[gtk::accessible::Property::Label(IMPORT_LINE)]);
         content.append(&import_button);
 
         // Transcribing: the animation fills the whole window, or the plain
