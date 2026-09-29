@@ -306,6 +306,7 @@ struct Recorder {
     settings_button: gtk::Button,
     settings_dialog: adw::PreferencesDialog,
     language_setting_row: adw::ComboRow,
+    your_name_row: adw::EntryRow,
     folder_row: adw::ActionRow,
     folder_button: gtk::Button,
     title_row: adw::EntryRow,
@@ -498,9 +499,15 @@ impl Recorder {
             .model(&gtk::StringList::new(&language_labels))
             .build();
         language_setting_row.set_selected(row_for(&settings::load_language()).unwrap_or(0) as u32);
+        let your_name_row = adw::EntryRow::builder()
+            .title("Your name")
+            .show_apply_button(true)
+            .build();
+        your_name_row.set_text(&settings::saved_your_name());
         let settings_group = adw::PreferencesGroup::new();
         settings_group.add(&format_row);
         settings_group.add(&language_setting_row);
+        settings_group.add(&your_name_row);
         settings_group.add(&folder_row);
         let settings_page = adw::PreferencesPage::builder().title("Settings").build();
         settings_page.add(&settings_group);
@@ -835,6 +842,7 @@ impl Recorder {
             settings_button,
             settings_dialog,
             language_setting_row,
+            your_name_row,
             folder_row,
             folder_button,
             title_row,
@@ -1072,6 +1080,11 @@ impl Recorder {
                     }
                 }
             });
+        // Saved on apply rather than on every keystroke: an empty field clears
+        // the name, which load_your_name reads back as "You".
+        self.your_name_row.connect_apply(move |row| {
+            settings::save_your_name(row.text().trim());
+        });
         let weak = Rc::downgrade(self);
         self.again_language_row.connect_selected_notify(move |row| {
             if let Some(r) = weak.upgrade()
@@ -3303,6 +3316,7 @@ impl Recorder {
         }
         if you_changed && let Some(you) = names.first() {
             settings::save_your_name(you);
+            self.your_name_row.set_text(you);
         }
         let text = std::fs::read_to_string(&transcript).ok();
         self.redraw_transcript(text.as_deref().unwrap_or(""));

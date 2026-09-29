@@ -62,14 +62,21 @@ pub fn save_language(code: &str) {
     save("language", code);
 }
 
-/// What the mic side is called in new transcripts, "You" until you change it.
-pub fn load_your_name() -> String {
+/// The name as saved, before the "You" fallback: empty when never set.
+pub fn saved_your_name() -> String {
     load()["your_name"]
         .as_str()
         .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .unwrap_or(crate::meeting::DEFAULT_YOU)
+        .unwrap_or("")
         .to_owned()
+}
+
+/// What the mic side is called in new transcripts, "You" until you change it.
+pub fn load_your_name() -> String {
+    match saved_your_name() {
+        name if !name.is_empty() => name,
+        _ => crate::meeting::DEFAULT_YOU.to_owned(),
+    }
 }
 
 pub fn save_your_name(name: &str) {
