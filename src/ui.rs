@@ -32,7 +32,8 @@ const FULL_SIZE: (i32, i32) = (480, 700);
 const COMPACT_SIZE: (i32, i32) = (300, 84);
 const DONE_SIZE: (i32, i32) = (1100, 760);
 /// What the recording page's language row is for, said the same way every time.
-const RECORD_LANGUAGE: &str = "Used for the transcript after the call";
+const RECORD_LANGUAGE: &str =
+    "For this meeting's transcript only; the default language lives in Settings";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum State {
@@ -304,6 +305,7 @@ struct Recorder {
     cancel_button: gtk::Button,
     settings_button: gtk::Button,
     settings_dialog: adw::PreferencesDialog,
+    language_setting_row: adw::ComboRow,
     folder_row: adw::ActionRow,
     folder_button: gtk::Button,
     title_row: adw::EntryRow,
@@ -488,8 +490,17 @@ impl Recorder {
             .css_classes(["flat"])
             .build();
         folder_row.add_suffix(&folder_button);
+        let language_setting_row = adw::ComboRow::builder()
+            .title("Language")
+            .subtitle("The default for new meetings")
+            .enable_search(true)
+            .expression(gtk::StringObject::this_expression("string"))
+            .model(&gtk::StringList::new(&language_labels))
+            .build();
+        language_setting_row.set_selected(row_for(&settings::load_language()).unwrap_or(0) as u32);
         let settings_group = adw::PreferencesGroup::new();
         settings_group.add(&format_row);
+        settings_group.add(&language_setting_row);
         settings_group.add(&folder_row);
         let settings_page = adw::PreferencesPage::builder().title("Settings").build();
         settings_page.add(&settings_group);
@@ -823,6 +834,7 @@ impl Recorder {
             cancel_button,
             settings_button,
             settings_dialog,
+            language_setting_row,
             folder_row,
             folder_button,
             title_row,
@@ -1038,18 +1050,28 @@ impl Recorder {
             }
         });
 
-        // The two language rows (recording page, done page) are one setting.
+        // The recording page's row and the done page's row are one meeting's
+        // language, not a saved setting: neither writes the default.
         let weak = Rc::downgrade(self);
         self.language_row.connect_selected_notify(move |row| {
-            if let Some(r) = weak.upgrade() {
-                if !r.loading.get() {
-                    settings::save_language(r.selected_language());
-                }
-                if r.again_language_row.selected() != row.selected() {
-                    r.again_language_row.set_selected(row.selected());
-                }
+            if let Some(r) = weak.upgrade()
+                && r.again_language_row.selected() != row.selected()
+            {
+                r.again_language_row.set_selected(row.selected());
             }
         });
+        // The default, written only from settings and carried into the
+        // meeting's row, which follows it while the window is open.
+        let weak = Rc::downgrade(self);
+        self.language_setting_row
+            .connect_selected_notify(move |row| {
+                if let Some(r) = weak.upgrade() {
+                    settings::save_language(selected_code(transcribe::languages(), row.selected()));
+                    if r.language_row.selected() != row.selected() {
+                        r.language_row.set_selected(row.selected());
+                    }
+                }
+            });
         let weak = Rc::downgrade(self);
         self.again_language_row.connect_selected_notify(move |row| {
             if let Some(r) = weak.upgrade()
