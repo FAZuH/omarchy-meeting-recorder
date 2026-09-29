@@ -21,6 +21,7 @@ use crate::config;
 use crate::export::{self, Format, export_audio, export_tracks};
 use crate::ipc::{self, SharedStatus, Status};
 use crate::meeting::{self, Manifest};
+use crate::models;
 use crate::player::Player;
 use crate::transcribe::{self, Abort, CANCELLED, Event};
 use crate::transcribing::Transcribing;
@@ -308,6 +309,9 @@ struct Recorder {
     settings_dialog: adw::PreferencesDialog,
     language_setting_row: adw::ComboRow,
     your_name_row: adw::EntryRow,
+    model_row: adw::ActionRow,
+    model_dropdown: gtk::DropDown,
+    plain_display_row: adw::SwitchRow,
     folder_row: adw::ActionRow,
     folder_button: gtk::Button,
     title_row: adw::EntryRow,
@@ -505,10 +509,27 @@ impl Recorder {
             .show_apply_button(true)
             .build();
         your_name_row.set_text(&settings::saved_your_name());
+        let model_row = adw::ActionRow::builder().title("Model").build();
+        let model_labels: Vec<String> = models::MODELS
+            .iter()
+            .map(|m| format!("{} ({} MB)", m.name, m.size_mb))
+            .collect();
+        let model_dropdown = gtk::DropDown::builder()
+            .model(&model_labels.into_iter().collect::<gtk::StringList>())
+            .show_arrow(true)
+            .valign(gtk::Align::Center)
+            .build();
+        model_row.add_suffix(&model_dropdown);
+        let plain_display_row = adw::SwitchRow::builder()
+            .title("Turn off transcribing animation")
+            .subtitle("Shows the stage, progress and lines as plain text instead. Takes effect the next time the recorder starts.")
+            .build();
         let settings_group = adw::PreferencesGroup::new();
         settings_group.add(&format_row);
         settings_group.add(&language_setting_row);
         settings_group.add(&your_name_row);
+        settings_group.add(&model_row);
+        settings_group.add(&plain_display_row);
         settings_group.add(&folder_row);
         let settings_page = adw::PreferencesPage::builder().title("Settings").build();
         settings_page.add(&settings_group);
@@ -859,6 +880,9 @@ impl Recorder {
             settings_dialog,
             language_setting_row,
             your_name_row,
+            model_row,
+            model_dropdown,
+            plain_display_row,
             folder_row,
             folder_button,
             title_row,
@@ -1038,6 +1062,38 @@ impl Recorder {
         self.folder_button.connect_clicked(move |_| {
             if let Some(r) = weak.upgrade() {
                 r.choose_folder(&r.settings_dialog, &r.folder_row);
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.model_dropdown.connect_selected_notify(move |row| {
+            let Some(r) = weak.upgrade() else { return };
+            if r.loading.get() {
+                return;
+            }
+            let Some(model) = models::MODELS.get(row.selected() as usize) else {
+                return;
+            };
+            match config::set_model(model.name) {
+                Ok(()) => r.update_model_banner(),
+                Err(message) => {
+                    r.settings_dialog.add_toast(adw::Toast::new(&format!(
+                        "Could not save the model: {message}"
+                    )));
+                }
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.plain_display_row.connect_active_notify(move |row| {
+            let Some(r) = weak.upgrade() else { return };
+            if r.loading.get() {
+                return;
+            }
+            if let Err(message) = config::set_plain_display(row.is_active()) {
+                r.settings_dialog.add_toast(adw::Toast::new(&format!(
+                    "Could not save the plain display: {message}"
+                )));
             }
         });
 
@@ -2038,6 +2094,14 @@ impl Recorder {
     fn open_settings(self: &Rc<Self>) {
         self.folder_row
             .set_subtitle(&config::output_dir().display().to_string());
+        self.model_row.set_subtitle(&model_subtitle());
+        self.model_row.set_sensitive(!models::overridden());
+        self.loading.set(true);
+        if let Some(i) = model_index(&models::configured()) {
+            self.model_dropdown.set_selected(i as u32);
+        }
+        self.plain_display_row.set_active(config::plain_display());
+        self.loading.set(false);
         self.settings_dialog.present(Some(&self.window));
     }
 
@@ -3751,6 +3815,26 @@ fn read_recording_note(staging: &std::path::Path) -> Option<RecordingNote> {
         format: Format::from_key(value["format"].as_str().unwrap_or("mono")),
         language: value["language"].as_str().unwrap_or("auto").to_owned(),
     })
+}
+
+/// What the Model row says under the dropdown, which only speaks when the
+/// dropdown cannot: it names the model either way, but says nothing when the
+/// model is one of the ten it already lists. `--model` outranks the config file
+/// for the whole run, so a pick made here would be ignored until the next one.
+fn model_subtitle() -> String {
+    let model = models::configured();
+    match models::overridden() {
+        true => format!("{model}, set by --model for this run"),
+        // The dropdown already says which of the ten it is on.
+        false if model_index(&model).is_some() => String::new(),
+        false => model,
+    }
+}
+
+/// Which dropdown row holds `name`, `None` for a model file's own path, which
+/// no row can stand for.
+fn model_index(name: &str) -> Option<usize> {
+    models::MODELS.iter().position(|m| m.name == name)
 }
 
 /// Which dropdown row holds `code`, the one a meeting's saved language is

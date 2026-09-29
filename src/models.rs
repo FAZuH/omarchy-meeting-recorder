@@ -86,6 +86,12 @@ pub fn set_override(name: &str) {
     *OVERRIDE.lock().unwrap() = Some(name.trim().to_owned());
 }
 
+/// Whether `--model` named the model for this run, which outranks the config
+/// file for as long as it is set.
+pub fn overridden() -> bool {
+    OVERRIDE.lock().unwrap().is_some()
+}
+
 pub fn config_file() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)

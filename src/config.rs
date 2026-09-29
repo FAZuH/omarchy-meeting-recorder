@@ -1,5 +1,6 @@
-//! Where meetings are saved and how the transcribing page looks: the
-//! `output_dir` and `plain_display` keys in the config file.
+//! Where meetings are saved, which whisper model transcribes and how the
+//! transcribing page looks: the `output_dir`, `model` and `plain_display` keys
+//! in the config file.
 
 use std::path::{Path, PathBuf};
 
@@ -40,18 +41,35 @@ pub fn set_output_dir(dir: &Path) -> Result<(), String> {
     if !dir.is_absolute() {
         return Err("the folder has to be a full path".into());
     }
+    set_key("output_dir", &quoted(&dir.display().to_string()))
+}
+
+/// The whisper model to transcribe with, as a name from `models::MODELS`.
+pub fn set_model(name: &str) -> Result<(), String> {
+    set_key("model", &quoted(name))
+}
+
+/// Whether the transcribing page shows the plain display. The page is built
+/// once, so this one only takes effect on the next start.
+pub fn set_plain_display(plain: bool) -> Result<(), String> {
+    set_key("plain_display", if plain { "true" } else { "false" })
+}
+
+/// Rewrites one top-level key and nothing else, so the actions a user has in
+/// the file come back as they were. A key that is not there yet goes above the
+/// first `[section]`.
+fn set_key(key: &str, value: &str) -> Result<(), String> {
     let file = config_file();
     let text = existing_text(&file)?;
-    let escaped = dir
-        .display()
-        .to_string()
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"");
-    let updated = with_output_dir(&text, &format!("output_dir = \"{escaped}\""));
+    let updated = with_key(&text, key, &format!("{key} = {value}"));
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     std::fs::write(&file, updated).map_err(|e| e.to_string())
+}
+
+fn quoted(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 /// The config file as it is, or nothing when there is none yet. Any other read
@@ -80,13 +98,13 @@ fn resolve(text: &str) -> PathBuf {
         .unwrap_or_else(default_dir)
 }
 
-fn with_output_dir(text: &str, line: &str) -> String {
+fn with_key(text: &str, wanted: &str, line: &str) -> String {
     let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
     let top = lines
         .iter()
         .position(|l| l.trim_start().starts_with('['))
         .unwrap_or(lines.len());
-    match lines[..top].iter().position(|l| key(l) == "output_dir") {
+    match lines[..top].iter().position(|l| key(l) == wanted) {
         Some(at) => lines[at] = line.to_owned(),
         None => lines.insert(0, line.to_owned()),
     }
@@ -153,7 +171,7 @@ mod tests {
         let text =
             "[[action]]\nname = \"Send\"\ncommand = \"send.sh\"\noutput_dir = \"/tmp/action\"\n";
         assert_eq!(resolve(text), default_dir());
-        let written = with_output_dir(text, "output_dir = \"/mnt/Meetings\"");
+        let written = with_key(text, "output_dir", "output_dir = \"/mnt/Meetings\"");
         assert!(written.starts_with("output_dir = \"/mnt/Meetings\"\n[[action]]"));
         assert!(written.contains("output_dir = \"/tmp/action\""));
         assert_eq!(written.matches("output_dir").count(), 2);
@@ -195,13 +213,37 @@ mod tests {
     #[test]
     fn setting_the_folder_keeps_the_rest_of_the_file() {
         let file = "model = \"small\"\n\n[[action]]\nname = \"Send\"\ncommand = \"send.sh\"\n";
-        let written = with_output_dir(file, "output_dir = \"/mnt/Meetings\"");
+        let written = with_key(file, "output_dir", "output_dir = \"/mnt/Meetings\"");
         assert!(written.starts_with("output_dir = \"/mnt/Meetings\"\nmodel = \"small\""));
         assert!(written.contains("[[action]]\nname = \"Send\"\ncommand = \"send.sh\"\n"));
         assert!(!written.contains("\n\noutput_dir"));
 
-        let again = with_output_dir(&written, "output_dir = \"/data/Meetings\"");
+        let again = with_key(&written, "output_dir", "output_dir = \"/data/Meetings\"");
         assert_eq!(again.matches("output_dir").count(), 1);
         assert!(again.contains("output_dir = \"/data/Meetings\"\nmodel = \"small\""));
+    }
+
+    #[test]
+    fn setting_a_second_key_leaves_the_first_one_alone() {
+        let file = "output_dir = \"/mnt/Meetings\"\n\n[[action]]\nname = \"Send\"\ncommand = \"send.sh\"\n";
+        let written = with_key(file, "plain_display", "plain_display = true");
+        assert!(written.starts_with("plain_display = true\noutput_dir = \"/mnt/Meetings\""));
+        assert!(plain_display_in(&written));
+        assert!(written.contains("[[action]]\nname = \"Send\"\ncommand = \"send.sh\"\n"));
+        assert_eq!(
+            with_key(&written, "output_dir", "output_dir = \"/data\"")
+                .matches("output_dir =")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_key_lands_above_the_first_section_and_not_inside_it() {
+        let file = "[general]\nmodel = \"small\"\n";
+        let written = with_key(file, "model", "model = \"large-v3\"");
+        assert!(written.starts_with("model = \"large-v3\"\n[general]\n"));
+        // The same key inside a section is somebody else's to say.
+        assert!(written.contains("[general]\nmodel = \"small\"\n"));
     }
 }
