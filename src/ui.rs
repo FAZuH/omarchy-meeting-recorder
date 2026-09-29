@@ -302,11 +302,10 @@ struct Recorder {
     seek_forward: gio::SimpleAction,
     compact_button: gtk::Button,
     cancel_button: gtk::Button,
+    settings_button: gtk::Button,
     title_row: adw::EntryRow,
     format_row: adw::ComboRow,
     language_row: adw::ComboRow,
-    folder_row: adw::ActionRow,
-    folder_button: gtk::Button,
     open_meeting_button: gtk::Button,
     transcribing: Transcribing,
     meters: [gtk::DrawingArea; 2],
@@ -407,6 +406,11 @@ impl Recorder {
             .action_name("win.compact")
             .build();
         header.pack_start(&compact_button);
+        let settings_button = gtk::Button::builder()
+            .icon_name("preferences-system-symbolic")
+            .tooltip_text("Settings")
+            .build();
+        header.pack_start(&settings_button);
         let cancel_button = gtk::Button::builder()
             .label("Cancel")
             .valign(gtk::Align::Center)
@@ -458,14 +462,6 @@ impl Recorder {
         group.add(&title_row);
         group.add(&format_row);
         group.add(&language_row);
-        let folder_row = adw::ActionRow::builder().title("Meetings folder").build();
-        let folder_button = gtk::Button::builder()
-            .label("Choose…")
-            .valign(gtk::Align::Center)
-            .css_classes(["flat"])
-            .build();
-        folder_row.add_suffix(&folder_button);
-        group.add(&folder_row);
         let open_row = adw::ActionRow::builder().title("Open a meeting").build();
         let open_meeting_button = gtk::Button::builder()
             .label("Open…")
@@ -802,11 +798,10 @@ impl Recorder {
             seek_forward,
             compact_button,
             cancel_button,
+            settings_button,
             title_row,
             format_row,
             language_row,
-            folder_row,
-            folder_button,
             open_meeting_button,
             transcribing,
             meters,
@@ -971,26 +966,10 @@ impl Recorder {
         });
 
         let weak = Rc::downgrade(self);
-        self.folder_button.connect_clicked(move |_| {
-            let Some(r) = weak.upgrade() else { return };
-            let dialog = gtk::FileDialog::builder()
-                .title("Where meetings are saved")
-                .build();
-            let this = r.clone();
-            dialog.select_folder(Some(&r.window), gio::Cancellable::NONE, move |result| {
-                let Some(path) = result.ok().and_then(|folder| folder.path()) else {
-                    return;
-                };
-                match config::set_output_dir(&path) {
-                    Ok(()) => {
-                        this.show_output_dir();
-                        this.toast("New meetings go there");
-                    }
-                    Err(message) => {
-                        this.toast(&format!("Could not save the folder: {message}"));
-                    }
-                }
-            });
+        self.settings_button.connect_clicked(move |_| {
+            if let Some(r) = weak.upgrade() {
+                r.open_settings();
+            }
         });
 
         let weak = Rc::downgrade(self);
@@ -1458,13 +1437,14 @@ impl Recorder {
     }
 
     fn render(&self) {
-        self.show_output_dir();
         let state = self.state.get();
         let recording = state == State::Recording;
         self.live.set(recording);
         self.dot.set_visible(recording);
         self.compact_button.set_visible(recording);
         self.cancel_button.set_visible(state == State::Transcribing);
+        self.settings_button
+            .set_visible(!matches!(state, State::Stopping | State::Transcribing));
         self.compact_action.set_enabled(recording);
         self.language_row
             .set_sensitive(!matches!(state, State::Stopping | State::Transcribing));
@@ -1967,9 +1947,68 @@ impl Recorder {
         self.stop();
     }
 
-    fn show_output_dir(&self) {
-        self.folder_row
-            .set_subtitle(&config::output_dir().display().to_string());
+    /// The settings page, built fresh each time so it shows what is stored now.
+    fn open_settings(self: &Rc<Self>) {
+        let dialog = adw::PreferencesDialog::builder()
+            .title("Settings")
+            .search_enabled(false)
+            .build();
+        let folder_row = adw::ActionRow::builder().title("Meetings folder").build();
+        folder_row.set_subtitle(&config::output_dir().display().to_string());
+        let folder_button = gtk::Button::builder()
+            .label("Choose…")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .build();
+        folder_row.add_suffix(&folder_button);
+        let group = adw::PreferencesGroup::new();
+        group.add(&folder_row);
+        let page = adw::PreferencesPage::builder().title("Settings").build();
+        page.add(&group);
+        dialog.add(&page);
+
+        let weak = Rc::downgrade(self);
+        let sheet_weak = dialog.downgrade();
+        let row_weak = folder_row.downgrade();
+        folder_button.connect_clicked(move |_| {
+            if let Some(r) = weak.upgrade()
+                && let (Some(sheet), Some(row)) = (sheet_weak.upgrade(), row_weak.upgrade())
+            {
+                r.choose_folder(&sheet, &row);
+            }
+        });
+        dialog.present(Some(&self.window));
+    }
+
+    /// Asks for a folder and stores it as where meetings are saved.
+    fn choose_folder(self: &Rc<Self>, dialog: &adw::PreferencesDialog, row: &adw::ActionRow) {
+        let picker = gtk::FileDialog::builder()
+            .title("Where meetings are saved")
+            .build();
+        let sheet_weak = dialog.downgrade();
+        let row_weak = row.downgrade();
+        picker.select_folder(Some(&self.window), gio::Cancellable::NONE, move |result| {
+            let Some(path) = result.ok().and_then(|folder| folder.path()) else {
+                return;
+            };
+            match config::set_output_dir(&path) {
+                Ok(()) => {
+                    if let Some(row) = row_weak.upgrade() {
+                        row.set_subtitle(&config::output_dir().display().to_string());
+                    }
+                    if let Some(sheet) = sheet_weak.upgrade() {
+                        sheet.add_toast(adw::Toast::new("New meetings go there"));
+                    }
+                }
+                Err(message) => {
+                    if let Some(sheet) = sheet_weak.upgrade() {
+                        sheet.add_toast(adw::Toast::new(&format!(
+                            "Could not save the folder: {message}"
+                        )));
+                    }
+                }
+            }
+        });
     }
 
     /// Says so when the speech model is not on disk yet, with a button to get it.
