@@ -17,13 +17,16 @@ optdepends=('quickshell: the bar widget, part of every Omarchy install'
 conflicts=('omarchy-meeting-recorder-bin')
 options=('!debug')
 # No source tarball: this package builds from the local checkout, see build().
+# The checkout has to be the one the rustc cache was filled from, so it is
+# named here and can be pointed elsewhere with MEETING_RECORDER_REPO.
+repo="${MEETING_RECORDER_REPO:-$HOME/Projects/omarchy/omarchy-meeting-recorder}"
 
 build() {
-  # Build in the checkout, not from the tarball: the machine's rustc cache
+  # Build in the checkout, not from a tarball: the machine's rustc cache
   # (mbx) serves rlibs that point at the native archives under this checkout's
   # target dir. Building elsewhere rebuilds those archives at a new path, and
   # the link then fails with undefined ring_core_* / whisper_rs symbols.
-  cd "$HOME/Projects/omarchy/omarchy-meeting-recorder"
+  cd "$repo"
   # mise wraps cargo with that cache; its cached rlibs lose the native
   # archives, so the package build uses rustup's cargo directly.
   export PATH="$HOME/.cargo/bin:$PATH"
@@ -35,7 +38,7 @@ build() {
 }
 
 package() {
-  cd "$HOME/Projects/omarchy/omarchy-meeting-recorder"
+  cd "$repo"
   install -Dm755 "$HOME/.cache/omarchy-meeting-recorder/pkg-target/release/omarchy-meeting-recorder" "$pkgdir/usr/bin/omarchy-meeting-recorder"
   install -Dm644 "data/omarchy-meeting-recorder.desktop" "$pkgdir/usr/share/applications/omarchy-meeting-recorder.desktop"
   install -Dm644 "data/omarchy-meeting-recorder.xml" "$pkgdir/usr/share/mime/packages/omarchy-meeting-recorder.xml"

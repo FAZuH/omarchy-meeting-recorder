@@ -12,7 +12,17 @@ Built for Omarchy on Hyprland (GTK 4 and libadwaita, written in Rust).
 
 ## Install
 
-Meeting Recorder is in the [Omarchy package repository](https://github.com/omacom/omarchy-pkgs):
+This fork packages itself from source, because the package repository carries
+upstream's binary:
+
+```bash
+git clone https://github.com/FAZuH/omarchy-meeting-recorder.git
+cd omarchy-meeting-recorder/packaging/source
+MEETING_RECORDER_REPO="$(cd ../.. && pwd)" makepkg -si
+```
+
+Upstream's package, if you want that one instead, is in the
+[Omarchy package repository](https://github.com/omacom/omarchy-pkgs):
 
 ```bash
 yay -S omarchy-meeting-recorder
@@ -24,7 +34,7 @@ For now it is in the edge channel, so this works if you run Omarchy's edge packa
 curl -fsSL https://raw.githubusercontent.com/jankeesvw/omarchy-meeting-recorder/main/install.sh | bash
 ```
 
-Either way `sudo pacman -R omarchy-meeting-recorder-bin` removes it again.
+Either way `sudo pacman -R omarchy-meeting-recorder` removes the fork's package and `sudo pacman -R omarchy-meeting-recorder-bin` upstream's.
 
 Then open **Meeting Recorder** from the launcher. The first transcription downloads the whisper model (about 1.6 GB, once), and the app shows you how far along it is. It offers to put a live waveform in your bar the first time, and the package prints the Hyprland rules for a floating window (also [below](#build-from-source)).
 
