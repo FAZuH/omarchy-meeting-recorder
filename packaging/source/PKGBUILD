@@ -21,15 +21,14 @@ sha256sums=('b7f78334dc04ef1988ae45056b4a8ebcd1b5bba31e358734177f168f90f98fc8')
 
 build() {
   cd "$srcdir/omarchy-meeting-recorder-$pkgver"
-  # Reuse the checkout's target dir so the dependency artifacts are not rebuilt.
-  CARGO_TARGET_DIR="$HOME/Projects/omarchy/omarchy-meeting-recorder/target" \
-    cargo build --release --locked
+  # A target dir of its own: reusing the checkout's one mixes artifacts built
+  # under different CFLAGS, and ring then links against a mismatched libcrypto.
+  CARGO_TARGET_DIR="$startdir/target" cargo build --release --locked
 }
 
 package() {
   cd "$srcdir/omarchy-meeting-recorder-$pkgver"
-  local target="$HOME/Projects/omarchy/omarchy-meeting-recorder/target"
-  install -Dm755 "$target/release/omarchy-meeting-recorder" "$pkgdir/usr/bin/omarchy-meeting-recorder"
+  install -Dm755 "$startdir/target/release/omarchy-meeting-recorder" "$pkgdir/usr/bin/omarchy-meeting-recorder"
   install -Dm644 "data/omarchy-meeting-recorder.desktop" "$pkgdir/usr/share/applications/omarchy-meeting-recorder.desktop"
   install -Dm644 "data/omarchy-meeting-recorder.xml" "$pkgdir/usr/share/mime/packages/omarchy-meeting-recorder.xml"
   # The bar widget, linked into ~/.config/omarchy/plugins by the installer.
