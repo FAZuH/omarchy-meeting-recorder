@@ -36,7 +36,7 @@ Prefer to build it yourself? See [Build from source](#build-from-source), or gra
 
 ### Checks the sound before you start
 
-The app opens ready, not recording. The two meters are live from the start, a still line that thickens as sound comes in, so you can see that both your microphone and the computer audio arrive before the meeting begins. Type a name if you like (otherwise it becomes "Meeting 14:30"), pick the audio format and the transcript language, and press **Start recording**.
+The app opens ready, not recording. The two meters are live from the start, the same moving waves as while recording, so you can see that both your microphone and the computer audio arrive before the meeting begins. Type a name if you like (otherwise it becomes "Meeting 14:30"), pick the audio format and the transcript language, and press **Start recording**.
 
 <p align="center"><img src="screenshots/ready.webp" alt="The ready page: meeting name, audio file, language, two meters that say Not recording, the Start recording button and Import an audio file, or drop one here" width="440"></p>
 
@@ -47,6 +47,16 @@ Your microphone and whatever your computer plays are recorded as two separate tr
 <p align="center"><img src="screenshots/recording.webp" alt="Recording: both meters moving, the clock, Pause and Stop recording" width="440">&nbsp;&nbsp;<img src="screenshots/paused.webp" alt="Paused: both waves frozen and dimmed with a PAUSED sign, Resume and Stop recording" width="440"></p>
 
 **Pause** freezes both waves under a "❚❚ PAUSED" sign and stops the clock; nothing is written to either track until you press **Resume**.
+
+### Records your webcam too, if you like
+
+Turn on **Webcam** and your camera is recorded next to the audio, as `webcam.mp4` (picture only) in the meeting folder, and a small live picture in its row shows what it sees. The video keeps time with the audio: with the camera on, a recording (or a resume) starts its audio once the first frame is in, pauses are left out as in the audio, and you can turn the camera on or off during the recording, black filling the time it was off. The toggle is remembered, and so is the camera, which is the first real one the system has. Open the meeting later and the video plays small in the corner of the transcript, in step with the audio.
+
+### Keeps your meeting notes next to the recording
+
+The **a** in the corner of the ready page opens meeting notes next to the recorder, empty in a new window: the script of a voice-over, or what you want to say in a meeting. The paragraph with the cursor is lit and kept in the middle; ↓ and ↑ (or Ctrl+↓ and Ctrl+↑ while you type) move to the next and the previous one, and every edit is saved right away. `omarchy-meeting-recorder --notes <file>` opens a file of your own there. A recording made with meeting notes open keeps a copy as `notes.md` in its meeting folder, and the done page shows it next to the transcript.
+
+![Recording Launch sync with the meeting notes beside it: the agenda for the call, with the paragraph about Northwind lit and the others dimmed](screenshots/notes.webp)
 
 ### Stays out of the way
 
@@ -76,7 +86,7 @@ Drop an audio file on the window, or click **Import an audio file**: a phone mem
 
 The done screen puts the transcript on the right: the time, the speaker and the text in their own columns, one paragraph per turn. Above it sits a player with a waveform of both sides, your side above the line and the other side below it. Click or drag in the waveform to seek, or click any line to play from there. The line that is playing is highlighted and the transcript scrolls along.
 
-On the left: the meeting name and one row per speaker, which you can rename at any time (the folder, the transcript and the manifest follow, and your own name is remembered for next time), the chapters, **Copy transcript** (also Enter), Open folder, New recording, and the language to transcribe again in.
+On the left: the meeting name and one row per speaker, which you can rename at any time (the folder, the transcript and the manifest follow, and your own name is remembered for next time; give two speakers the same name and they become one), the chapters, **Copy transcript** (also Enter), Open folder, New recording, and the language to transcribe again in.
 
 ![The done screen while playing: the current chapter selected and the current line highlighted](screenshots/done.webp)
 
@@ -98,7 +108,7 @@ Chapters are an extra, not a requirement: without an agent the button is simply 
 
 ### Runs your own actions
 
-Put a few scripts of your own under **Actions** on the done page: store the transcript in your notes, publish it, mail it around. They go in `~/.config/omarchy-meeting-recorder/config.toml`, each with a name for the menu and a command. Until there is one, the button is **Add actions…** and explains how. See [Actions](#actions).
+Put a few scripts of your own under **Actions** on the done page: store the transcript in your notes, publish it, mail it around. They go in `~/.config/omarchy-meeting-recorder/config.toml`, each with a name for the menu and a command. An action can also run on its own, as soon as the transcript is done. Until there is one, the button is **Add actions…** and explains how. See [Actions](#actions).
 
 ### Wears your Omarchy theme
 
@@ -116,7 +126,7 @@ If the app quits while it records (a crash, a logout, a power cut), the next sta
 
 ## Handy to know
 
-- **Keyboard.** Ctrl+M switches between the full window and the compact strip. Ctrl+N opens another window. On the done page Enter copies the transcript. Ctrl+W closes the window and Ctrl+Q all of them, and they ask first while recording or transcribing.
+- **Keyboard.** Ctrl+M switches between the full window and the compact strip. Ctrl+N opens another window. On the done page Enter copies the transcript. Ctrl+F finds text in it: the match is marked, Enter and Shift+Enter move between matches, and Escape closes the bar. Ctrl+W closes the window and Ctrl+Q all of them, and they ask first while recording or transcribing.
 - **The name** stays editable all the time. After the transcript is done, changing it (Enter, or leaving the field) renames the meeting folder and the heading in the transcript.
 - **Closing** while recording or transcribing asks first. You can stop and close, let the transcription finish in the background and quit afterwards, or cancel the transcription; the audio is kept either way.
 - **Opening a meeting later.** Double-click its `.meeting-recorder` file, or run `omarchy-meeting-recorder <folder>`. It opens on the done page with the settings it was made with. When the window is busy recording or transcribing, the meeting opens in a window of its own.
@@ -140,15 +150,17 @@ Inside, the audio in the format you picked, the transcript, a `.meeting-recorder
   - **Stereo**: `audio.ogg`, mic on the left channel, computer audio on the right
   - **Separate files**: `mic.ogg` and `computer.ogg`
 - `.tracks/mic.ogg` and `.tracks/computer.ogg`, a hidden copy of both tracks in mono. This is what Transcribe again uses, so the speakers stay apart whatever audio format you chose. Delete the directory if you do not need that.
+- `notes.md`, the meeting notes that were open while you recorded, when there were any
+- `webcam.mp4`, the camera, picture only and as long as the audio, when the webcam was on
 - For an imported file: `audio.ogg`, the transcript and the `.meeting-recorder` file; the original file is left where it was.
 
 Both tracks are always recorded separately, and each is levelled to the same speech loudness when it is saved, so a quiet microphone and a loud call end up equally easy to hear. The format can be switched until the moment you press stop.
 
 ## How it works
 
-- **Recording.** The mic (`@DEFAULT_SOURCE@`) and the monitor of the default output (`@DEFAULT_MONITOR@`) are captured with `parec`. Because it follows the default output, switching to a headset during a call keeps working. `ffmpeg` encodes the audio to Opus when you stop.
+- **Recording.** The mic (`@DEFAULT_SOURCE@`) and the monitor of the default output (`@DEFAULT_MONITOR@`) are captured with `parec`. Because it follows the default output, switching to a headset during a call keeps working. When the audio stops coming in for a moment, say while a Bluetooth headset switches to its headset mode, that track gets silence for the time, so the two tracks stay in step. `ffmpeg` encodes the audio to Opus when you stop.
 - **Transcription.** After the call both tracks are mixed and transcribed in one pass with whisper-rs, using the `large-v3-turbo` model unless you pick another, so there is a single timeline. Long silences are skipped, which keeps whisper from inventing text in them, and word times come from whisper's attention alignment (DTW).
-- **Who said what.** The mic and the computer audio are transcribed one at a time, so the side of each line is simply its track, and two people talking at once, or someone talking over music, are both kept. Through speakers the other side leaks into your mic; the app leaves out what is only that echo. When several voices share one side, a colleague next to you or three people on the other end, they are told apart as well (see below): "You 1", "You 2" and "Remote 1", "Remote 2" and so on, each with its own name field.
+- **Who said what.** The mic and the computer audio are transcribed one at a time, so the side of each line is simply its track, and two people talking at once, or someone talking over music, are both kept. Through speakers the other side leaks into your mic; the app leaves out what is only that echo, also when it is loud enough to be heard as a voice of its own: a voice on the mic that only speaks while the computer audio does is echo. When several voices share one side, a colleague next to you or three people on the other end, they are told apart as well (see below): "You 1", "You 2" and "Remote 1", "Remote 2" and so on, each with its own name field.
 - **Imported files.** A single audio file has no second track to tell the speakers apart, so the voices themselves are told apart with NVIDIA's [Nemotron 3 Diarization](https://huggingface.co/nvidia/Nemotron-3-Diarization), run locally through ONNX Runtime. It follows up to eight speakers, also when they talk at the same time, and numbers them "Speaker 1", "Speaker 2" and so on in the order they first speak. The number of speakers is found automatically (voices heard for only a few seconds are folded into the nearest real speaker) or can be fixed. A sentence always goes to one speaker as a whole. Similar voices and fast back-and-forth can still land on the wrong speaker, which the swap-speaker button fixes per line.
 - **Chapters.** The recorder runs `omarchy-default-agent`'s agent headless and with every tool switched off, in an empty working directory, bounded in time and size. Agents that cannot run without tools are not used.
 - **Playback.** `ffmpeg` decodes into `pacat`, so playing a meeting back needs nothing beyond what recording already uses.
@@ -165,7 +177,7 @@ output_dir = "/home/you/Meetings"   # where new meetings are saved; ~/Documents/
 plain_display = true   # a plain status page while transcribing, instead of the animation
 ```
 
-`output_dir` wants a full path, and a leading `~` or `~/` is understood. The ready page shows the folder it is using, with a **Choose…** button that writes the folder you pick straight back into this file, so the next meeting lands there without a restart. Meetings recorded earlier stay where they are, and nothing is moved. Keep `output_dir` at the top of the file, above any `[[action]]` table: a key below one belongs to that action. Leave it out and every meeting goes to `~/Documents/Meetings`, as before.
+`output_dir` wants a full path, and a leading `~` or `~/` is understood. The Settings page shows the folder it is using, with a **Choose…** button that writes the folder you pick straight back into this file, so the next meeting lands there without a restart. Meetings recorded earlier stay where they are, and nothing is moved. Keep `output_dir` at the top of the file, above any `[[action]]` table: a key below one belongs to that action. Leave it out and every meeting goes to `~/Documents/Meetings`, as before.
 
 `plain_display` takes `true` or `false`, and anything else counts as off. With it on, transcribing shows the stage, a progress bar and the lines as they come in, and the app stops redrawing the window on every frame, which is what makes the rest of the desktop stutter while a long meeting is transcribed. It is read when a window opens, so set it before you start or open a new window to see it. Leave it out and you get the animation, as before.
 
@@ -175,9 +187,19 @@ The command-line `transcribe` and `transcribe-file` take `--model` instead. When
 
 The app looks for `ggml-<model>.bin`, for instance `ggml-large-v3-turbo.bin`, in `~/.local/share/omarchy-meeting-recorder/models/`. If you use [voxtype](https://voxtype.io) and it already downloaded that model to `~/.local/share/voxtype/models/`, that copy is used. Otherwise it is downloaded (about 1.6 GB for `large-v3-turbo`) from [Hugging Face](https://huggingface.co/ggerganov/whisper.cpp). Finding speakers downloads the speaker model on first use (about 120 MB) to `nemotron-3-diarization/` in the same directory: the int8 ONNX export of Nemotron 3 Diarization from the [Hugging Face ONNX community](https://huggingface.co/onnx-community/Nemotron-3-Diarization-ONNX), pinned to one revision. The model is NVIDIA's, under the [OpenMDW license](https://huggingface.co/nvidia/Nemotron-3-Diarization). ONNX Runtime is compiled into the binary, so nothing else is needed at runtime.
 
+### Languages
+
+The Language dropdowns offer Auto-detect, English, Dutch, German, French, Spanish, Italian and Portuguese, and then every other language whisper knows, by name. The list is long, so the row can be searched: type a few letters and the matches are what is left. The ones you name in `~/.config/omarchy-meeting-recorder/config.toml` come right after those, by code or by English name:
+
+```toml
+languages = ["th", "ja", "Korean"]
+```
+
+They are added after the built-in ones, named the way whisper names them (Thai, Japanese, Korean), and picked up the next time the app starts. A name whisper does not know is skipped. The `.en` models only transcribe English, so use a multilingual model, like the default `large-v3-turbo`, for other languages.
+
 ## Actions
 
-Your own scripts, picked from the **Actions** menu on the done page: store the transcript in Obsidian, publish it, mail it around. Each is a name and a command in `~/.config/omarchy-meeting-recorder/config.toml`; the command gets the meeting folder and the meeting's details, and what it prints last shows up in the app, with an **Open** button for a link.
+Your own scripts, picked from the **Actions** menu on the done page: store the transcript in Obsidian, publish it, mail it around. Each is a name and a command in `~/.config/omarchy-meeting-recorder/config.toml`; the command gets the meeting folder and the meeting's details, and what it prints last shows up in the app, with an **Open** button for a link. Give one `auto = true` and it runs by itself every time a transcript is done, after the chapters when there are any: a meeting is filed in your notes, or handed to a pipeline of your own, without a click.
 
 <p align="center"><img src="screenshots/actions-menu.webp" alt="Clicking Actions on the done page: the view zooms in on the menu with Store transcript in Obsidian and Publish as public transcript" width="700"></p>
 
@@ -263,27 +285,29 @@ This also recovers a failed first-start “Add to Bar” attempt in version 1.0.
 
 | Command | What it does |
 |---|---|
-| `omarchy-meeting-recorder` | Open the recorder, ready to record |
+| `omarchy-meeting-recorder [--name <name>] [--notes <file>]` | Open the recorder, ready to record. `--name` names the meeting about to be recorded, whoever presses Start; `--notes` shows a file as meeting notes next to the recorder, to read from and edit while recording |
 | `omarchy-meeting-recorder <folder or .meeting-recorder file>` | Open a saved meeting on the done page |
-| `omarchy-meeting-recorder start` | Start recording in the open window, for a keybinding |
+| `omarchy-meeting-recorder start [--name <name>] [--notes <file>]` | Start recording, for a keybinding; opens the recorder first when it is not running. With a name, the meeting gets that name (a script can pass a calendar event's title); the name without `--name` works too. With notes, they open next to the recorder |
 | `omarchy-meeting-recorder pause` | Pause or resume the running recording |
 | `omarchy-meeting-recorder stop` | Stop the running recording |
 | `omarchy-meeting-recorder compact` | Switch the recording window between full and compact |
 | `omarchy-meeting-recorder new-window` | Open another window, or the app when it is not running |
-| `omarchy-meeting-recorder watch` | Stream the recorder state as NDJSON, for the bar widget |
+| `omarchy-meeting-recorder watch` | Stream the recorder state as NDJSON, for the bar widget; a line carries the meeting's `folder` once it has one |
+| `omarchy-meeting-recorder wait [--audio]` | Wait until the meeting being recorded is done and print its folder, for a script or an agent; with `--audio` as soon as the audio is saved, before the transcript |
 | `omarchy-meeting-recorder transcribe <mic> <computer> [--language xx] [--model name]` | Transcribe two tracks and print the transcript as Markdown |
 | `omarchy-meeting-recorder transcribe-file <audio> [--speakers N] [--language xx] [--model name]` | Transcribe one file, telling the voices apart, and print the transcript as Markdown |
 | `omarchy-meeting-recorder ask "<prompt>" < text` | Run a prompt over stdin through the default agent, without tools (`ask --agent` shows which agent that is) |
 | `omarchy-meeting-recorder action "<name>" <meeting folder>` | Run one of your [actions](docs/actions.md) on a meeting, as the done page does; without arguments it lists them |
 
-For example:
+Every flag takes its value after a space or an equals sign: `--name "Weekly sync"` and `--name="Weekly sync"` are the same. For example:
 
 ```bash
+omarchy-meeting-recorder --notes script.md --name "Voice-over"
 omarchy-meeting-recorder transcribe mic.ogg computer.ogg --language en > transcript.md
 omarchy-meeting-recorder transcribe-file interview.mp3 --speakers 2 > transcript.md
 ```
 
-Any format ffmpeg can read works. `--language` takes `auto` (the default) or any language whisper knows; the Language row in the app lists them all, and you can search it.
+Any format ffmpeg can read works. `--language` takes `auto` (the default) or any language whisper knows, such as `en`, `nl`, `id` or `th`; the Language row in the app lists them all, and you can search it.
 
 ## The screenshots
 

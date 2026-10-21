@@ -22,6 +22,7 @@ use crate::export::{self, Format, export_audio, export_tracks};
 use crate::ipc::{self, SharedStatus, Status};
 use crate::meeting::{self, Manifest};
 use crate::models;
+use crate::notes::Notes;
 use crate::player::Player;
 use crate::transcribe::{self, Abort, CANCELLED, Event};
 use crate::transcribing::Transcribing;
@@ -36,6 +37,12 @@ const DONE_SIZE: (i32, i32) = (1100, 760);
 const RECORD_LANGUAGE: &str =
     "For this meeting's transcript only; the default language lives in Settings";
 const IMPORT_LINE: &str = "Import an audio file, or drop one here";
+/// The recording page with the notes next to it: wider, just as high.
+const NOTES_SIZE: (i32, i32) = (1100, FULL_SIZE.1);
+/// The done page with the meeting's notes next to the transcript.
+const DONE_NOTES_SIZE: (i32, i32) = (1560, DONE_SIZE.1);
+/// How wide the notes are next to the transcript.
+const DONE_NOTES_WIDTH: i32 = 520;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum State {
@@ -112,7 +119,7 @@ impl Hub {
                 let Some(hub) = weak.upgrade() else {
                     break;
                 };
-                hub.command(&app_for_commands, command);
+                hub.command(&app_for_commands, command.0, &command.1);
             }
         });
 
@@ -143,6 +150,7 @@ impl Hub {
     fn add_window(self: &Rc<Self>, app: &adw::Application) -> Rc<Recorder> {
         let recorder = Recorder::new(app, self);
         self.windows.borrow_mut().push(recorder.clone());
+        recorder.learn_hypr_address();
         let weak = Rc::downgrade(self);
         let status = recorder.shared.clone();
         recorder.window.connect_destroy(move |_| {
@@ -208,9 +216,26 @@ impl Hub {
     }
 
     /// A command from the socket: `omarchy-meeting-recorder start` and friends.
-    fn command(self: &Rc<Self>, app: &adw::Application, command: &str) {
+    /// `title` is what came with it: the name for `start`, the notes file for
+    /// `notes`, "" without one.
+    fn command(self: &Rc<Self>, app: &adw::Application, command: &str, title: &str) {
         if command == "new-window" {
             self.add_window(app).window.present();
+            return;
+        }
+        if command == "notes" || command == "name" {
+            let r = self.recording().unwrap_or_else(|| self.free_window(app));
+            // Notes are for reading while recording: a window showing a meeting
+            // goes back to the recording page first.
+            if r.state.get() == State::Done {
+                r.ready();
+            }
+            if command == "notes" {
+                r.open_notes(std::path::Path::new(title));
+            } else if r.state.get() == State::Idle {
+                set_name(&r.title_row, title);
+            }
+            r.window.present();
             return;
         }
         let r = match command {
@@ -220,11 +245,15 @@ impl Hub {
             _ => self.target(app),
         };
         match command {
-            // A name typed on the ready page is kept; from the done page
-            // it starts fresh.
-            "start" if r.state.get() == State::Idle => r.start(),
-            "start" if r.state.get() == State::Done => {
-                r.ready();
+            // A name typed on the ready page is kept unless the command
+            // brings one; from the done page it starts fresh.
+            "start" if matches!(r.state.get(), State::Idle | State::Done) => {
+                if r.state.get() == State::Done {
+                    r.ready();
+                }
+                if !title.is_empty() {
+                    set_name(&r.title_row, title);
+                }
                 r.start();
             }
             "stop" => r.stop(),
@@ -250,6 +279,7 @@ pub fn run(open: Option<&str>) -> glib::ExitCode {
             }
         });
         app.set_accels_for_action("win.compact", &["<Control>m"]);
+        app.set_accels_for_action("win.find", &["<Control>f"]);
         app.set_accels_for_action("window.close", &["<Control>w"]);
         app.set_accels_for_action("app.quit", &["<Control>q"]);
         app.set_accels_for_action("app.new-window", &["<Control>n"]);
@@ -318,6 +348,15 @@ struct Recorder {
     format_row: adw::ComboRow,
     language_row: adw::ComboRow,
     open_meeting_button: gtk::Button,
+    /// Whether to record the camera next to the audio.
+    webcam_row: adw::SwitchRow,
+    /// The camera the toggle records, when there is one.
+    webcam_camera: Option<(PathBuf, String)>,
+    webcam: crate::webcam::Webcam,
+    /// Waiting for the camera's first frame before the audio starts or resumes.
+    starting: Cell<bool>,
+    /// What the camera sees, in the webcam row, before and while recording.
+    webcam_preview: gtk::Picture,
     transcribing: Transcribing,
     meters: [gtk::DrawingArea; 2],
     compact_meters: [gtk::DrawingArea; 2],
@@ -343,6 +382,21 @@ struct Recorder {
     done_meta: gtk::Label,
     transcript_list: gtk::ListBox,
     transcript_scroll: gtk::ScrolledWindow,
+    find_button: gtk::Button,
+    find_bar: gtk::Box,
+    find_entry: gtk::SearchEntry,
+    find_count: gtk::Label,
+    find_prev: gtk::Button,
+    find_next: gtk::Button,
+    /// Text of each transcript row, in list order, for Ctrl+F.
+    search_rows: RefCell<Vec<String>>,
+    /// Row indexes of the current query.
+    find_hits: RefCell<Vec<i32>>,
+    /// The query those hits were computed for. Enter before the search
+    /// delay elapses still uses what is typed now.
+    find_query: RefCell<String>,
+    /// Which of `find_hits` is the one on screen.
+    find_at: Cell<usize>,
     player: Player,
     /// Start of each transcript line in ms, by buffer line, for seeking and highlighting.
     segments: RefCell<Vec<(i32, i64)>>,
@@ -359,12 +413,18 @@ struct Recorder {
     /// Looked up once: the default agent, if any.
     agent: std::cell::OnceCell<Option<Agent>>,
     generating: Cell<bool>,
+    /// The meeting whose automatic actions are still to run: set when its
+    /// transcript is done, taken once the chapters are too.
+    auto_actions_due: RefCell<Option<PathBuf>>,
     current_line: Cell<i32>,
 
     mic: Source,
     system: Source,
     shared: SharedStatus,
     hub: std::rc::Weak<Hub>,
+    /// This window's address in Hyprland, learnt once it is on screen, so a
+    /// resize reaches this window and not another one of the app.
+    hypr_address: RefCell<Option<String>>,
 
     state: Cell<State>,
     compact: Cell<bool>,
@@ -372,8 +432,6 @@ struct Recorder {
     started_at: Cell<i64>,
     paused: Cell<bool>,
     frozen: [Frozen; 2],
-    /// The waves only move while recording; before that they would look like it.
-    live: Rc<Cell<bool>>,
     /// When the animation came on screen, to keep it there long enough.
     animation_since: Cell<Option<std::time::Instant>>,
     paused_secs: Cell<i64>,
@@ -391,6 +449,14 @@ struct Recorder {
     loading: Cell<bool>,
     /// The settings of the meeting on the done page.
     manifest: RefCell<Option<Manifest>>,
+    /// Notes to read from, next to the recording page when they are open.
+    notes: Rc<Notes>,
+    /// The [a] in the corner of the recording page that opens and closes it.
+    notes_button: gtk::Button,
+    /// The notes file read from while recording, to come back to for the next take.
+    live_notes: RefCell<Option<PathBuf>>,
+    /// The notes on screen are the copy in the meeting on the done page.
+    showing_meeting_notes: Cell<bool>,
 }
 
 impl Recorder {
@@ -428,6 +494,13 @@ impl Recorder {
             .css_classes(["flat"])
             .build();
         header.pack_end(&cancel_button);
+        let find_button = gtk::Button::builder()
+            .icon_name("system-search-symbolic")
+            .tooltip_text("Find in the transcript (Ctrl+F)")
+            .action_name("win.find")
+            .visible(false)
+            .build();
+        header.pack_end(&find_button);
         view.add_top_bar(&header);
         // Under the header bar, full width, while the speech model still has
         // to be downloaded.
@@ -435,7 +508,12 @@ impl Recorder {
         view.add_top_bar(&model_banner);
         let toasts = adw::ToastOverlay::new();
         view.set_content(Some(&toasts));
-        window.set_content(Some(&view));
+        view.set_hexpand(true);
+        let notes = Notes::new();
+        let panes = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        panes.append(&view);
+        panes.append(&notes.widget);
+        window.set_content(Some(&panes));
 
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -470,6 +548,37 @@ impl Recorder {
             .build();
         let saved = settings::load_language();
         language_row.set_selected(row_for(&saved).unwrap_or(0) as u32);
+        let webcam_camera =
+            crate::webcam::pick(&crate::webcam::devices(), &settings::load_webcam());
+        let webcam_row = adw::SwitchRow::builder()
+            .title("Webcam")
+            .subtitle(match &webcam_camera {
+                Some((_, name)) => format!("{name}, recorded as webcam.mp4"),
+                None => "No camera found".to_owned(),
+            })
+            .active(webcam_camera.is_some() && settings::load_webcam_on())
+            .sensitive(webcam_camera.is_some())
+            .build();
+        let webcam_preview = gtk::Picture::builder()
+            .content_fit(gtk::ContentFit::Cover)
+            .width_request(96)
+            .height_request(54)
+            .valign(gtk::Align::Center)
+            .css_classes(["webcam-preview"])
+            .visible(false)
+            .build();
+        webcam_preview.set_overflow(gtk::Overflow::Hidden);
+        webcam_row.add_prefix(&webcam_preview);
+        let (frames_tx, frames_rx) = async_channel::bounded::<Vec<u8>>(2);
+        let picture = webcam_preview.clone();
+        glib::spawn_future_local(async move {
+            while let Ok(frame) = frames_rx.recv().await {
+                if let Ok(texture) = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(frame))
+                {
+                    picture.set_paintable(Some(&texture));
+                }
+            }
+        });
         group.add(&title_row);
         group.add(&language_row);
         let open_row = adw::ActionRow::builder().title("Open a meeting").build();
@@ -480,6 +589,7 @@ impl Recorder {
             .build();
         open_row.add_suffix(&open_meeting_button);
         group.add(&open_row);
+        group.add(&webcam_row);
         content.append(&group);
 
         // The settings page: built once, so format_row keeps the identity that
@@ -536,10 +646,9 @@ impl Recorder {
         settings_dialog.add(&settings_page);
 
         let frozen: [Frozen; 2] = Default::default();
-        let live: Rc<Cell<bool>> = Rc::default();
         let meters = [
-            meter(&mic, ("blue", MIC_COLOR), 56, &frozen[0], &live),
-            meter(&system, ("orange", SYSTEM_COLOR), 56, &frozen[1], &live),
+            meter(&mic, ("blue", MIC_COLOR), 56, &frozen[0]),
+            meter(&system, ("orange", SYSTEM_COLOR), 56, &frozen[1]),
         ];
         let meters_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -764,7 +873,53 @@ impl Recorder {
             .css_classes(["card"])
             .build();
         transcript_scroll.set_overflow(gtk::Overflow::Hidden);
-        right.append(&transcript_scroll);
+        // Hidden until Ctrl+F on the done page. Sits above the transcript so
+        // the lines it marks stay visible underneath.
+        let find_entry = gtk::SearchEntry::builder()
+            .placeholder_text("Find in the transcript")
+            .activates_default(false)
+            .hexpand(true)
+            .build();
+        let find_count = gtk::Label::builder()
+            .width_chars(11)
+            .xalign(1.0)
+            .css_classes(["dim-label", "numeric"])
+            .build();
+        let find_nav = |icon: &str, tooltip: &str| {
+            gtk::Button::builder()
+                .icon_name(icon)
+                .tooltip_text(tooltip)
+                .sensitive(false)
+                .css_classes(["flat", "circular"])
+                .build()
+        };
+        let find_prev = find_nav("go-up-symbolic", "Previous match (Shift+Enter)");
+        let find_next = find_nav("go-down-symbolic", "Next match (Enter)");
+        let find_close = gtk::Button::builder()
+            .icon_name("window-close-symbolic")
+            .tooltip_text("Close (Escape)")
+            .css_classes(["flat", "circular"])
+            .build();
+        let find_bar = gtk::Box::builder().spacing(6).visible(false).build();
+        find_bar.append(&find_entry);
+        find_bar.append(&find_count);
+        find_bar.append(&find_prev);
+        find_bar.append(&find_next);
+        find_bar.append(&find_close);
+        right.append(&find_bar);
+        // The webcam, when the meeting has one, floats in the corner of the transcript.
+        let transcript_layers = gtk::Overlay::builder()
+            .child(&transcript_scroll)
+            .vexpand(true)
+            .build();
+        right.append(&transcript_layers);
+        let pip = player.video_widget();
+        pip.set_halign(gtk::Align::End);
+        pip.set_valign(gtk::Align::End);
+        pip.set_margin_end(16);
+        pip.set_margin_bottom(16);
+        pip.add_css_class("webcam-pip");
+        transcript_layers.add_overlay(pip);
 
         let done = gtk::Box::builder()
             .spacing(24)
@@ -786,8 +941,8 @@ impl Recorder {
 
         // Compact mode: only the two waves and the clock.
         let compact_meters = [
-            meter(&mic, ("blue", MIC_COLOR), 26, &frozen[0], &live),
-            meter(&system, ("orange", SYSTEM_COLOR), 26, &frozen[1], &live),
+            meter(&mic, ("blue", MIC_COLOR), 26, &frozen[0]),
+            meter(&system, ("orange", SYSTEM_COLOR), 26, &frozen[1]),
         ];
         let compact_dot = gtk::Label::builder()
             .label("●")
@@ -853,10 +1008,22 @@ impl Recorder {
             .build();
         let overlay = gtk::Overlay::builder().child(&layout).build();
         overlay.add_overlay(&drop_hint);
+        let notes_button = gtk::Button::builder()
+            .label("a")
+            .tooltip_text("Meeting notes")
+            .css_classes(["flat", "notes-toggle"])
+            .halign(gtk::Align::End)
+            .valign(gtk::Align::End)
+            .margin_end(12)
+            .margin_bottom(12)
+            .build();
+        overlay.add_overlay(&notes_button);
         toasts.set_child(Some(&overlay));
 
         let compact_action = gio::SimpleAction::new("compact", None);
         window.add_action(&compact_action);
+        let find_action = gio::SimpleAction::new("find", None);
+        window.add_action(&find_action);
         let run_action = gio::SimpleAction::new("run-action", Some(glib::VariantTy::INT32));
         window.add_action(&run_action);
         let seek_back = gio::SimpleAction::new("seek-back", None);
@@ -889,6 +1056,11 @@ impl Recorder {
             format_row,
             language_row,
             open_meeting_button,
+            webcam_row,
+            webcam_camera,
+            webcam: crate::webcam::Webcam::new(frames_tx),
+            starting: Cell::new(false),
+            webcam_preview,
             transcribing,
             meters,
             compact_meters,
@@ -911,6 +1083,16 @@ impl Recorder {
             done_meta,
             transcript_list,
             transcript_scroll,
+            find_button,
+            find_bar,
+            find_entry,
+            find_count,
+            find_prev,
+            find_next,
+            search_rows: RefCell::default(),
+            find_hits: RefCell::default(),
+            find_query: RefCell::default(),
+            find_at: Cell::new(0),
             player,
             segments: RefCell::default(),
             lines: RefCell::default(),
@@ -922,18 +1104,19 @@ impl Recorder {
             chapters_spinner,
             agent: std::cell::OnceCell::new(),
             generating: Cell::new(false),
+            auto_actions_due: RefCell::default(),
             current_line: Cell::new(-1),
             mic,
             system,
             shared,
             hub: Rc::downgrade(hub),
+            hypr_address: RefCell::default(),
             state: Cell::new(State::Idle),
             compact: Cell::new(false),
             full_size: Cell::new(FULL_SIZE),
             started_at: Cell::new(0),
             paused: Cell::new(false),
             frozen,
-            live,
             animation_since: Cell::new(None),
             paused_secs: Cell::new(0),
             pause_began: Cell::new(0),
@@ -948,13 +1131,151 @@ impl Recorder {
             quit_when_done: Cell::new(false),
             loading: Cell::new(false),
             manifest: RefCell::default(),
+            notes,
+            notes_button,
+            live_notes: RefCell::default(),
+            showing_meeting_notes: Cell::new(false),
         });
         recorder.connect_signals(&open_button, &new_button);
+        recorder.connect_find(&find_close);
         recorder.render();
         recorder
     }
 
+    fn connect_find(self: &Rc<Self>, find_close: &gtk::Button) {
+        let weak = Rc::downgrade(self);
+        self.find_entry.connect_search_changed(move |_| {
+            if let Some(r) = weak.upgrade() {
+                r.apply_find(true);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.find_entry.connect_activate(move |_| {
+            if let Some(r) = weak.upgrade() {
+                r.find_again(1);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.find_entry.connect_next_match(move |_| {
+            if let Some(r) = weak.upgrade() {
+                r.find_again(1);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.find_entry.connect_previous_match(move |_| {
+            if let Some(r) = weak.upgrade() {
+                r.find_again(-1);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.find_entry.connect_stop_search(move |_| {
+            if let Some(r) = weak.upgrade() {
+                r.close_find();
+            }
+        });
+        // Shift+Enter is still Enter to the entry, which would move forward.
+        // Catch it on the way in and go back instead.
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak = Rc::downgrade(self);
+        keys.connect_key_pressed(move |_, key, _, modifiers| {
+            let enter = matches!(key, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter);
+            if enter && modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+                if let Some(r) = weak.upgrade() {
+                    r.find_again(-1);
+                }
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        self.find_entry.add_controller(keys);
+
+        let weak = Rc::downgrade(self);
+        self.find_prev.connect_clicked(move |_| {
+            if let Some(r) = weak.upgrade() {
+                r.find_again(-1);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.find_next.connect_clicked(move |_| {
+            if let Some(r) = weak.upgrade() {
+                r.find_again(1);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        find_close.connect_clicked(move |_| {
+            if let Some(r) = weak.upgrade() {
+                r.close_find();
+            }
+        });
+        if let Some(action) = self.window.lookup_action("find") {
+            let weak = Rc::downgrade(self);
+            action
+                .downcast::<gio::SimpleAction>()
+                .expect("find is a SimpleAction")
+                .connect_activate(move |_, _| {
+                    if let Some(r) = weak.upgrade() {
+                        r.open_find();
+                    }
+                });
+        }
+    }
+
     fn connect_signals(self: &Rc<Self>, open_button: &gtk::Button, new_button: &gtk::Button) {
+        let weak = Rc::downgrade(self);
+        self.notes.close_button.connect_clicked(move |_| {
+            let Some(r) = weak.upgrade() else { return };
+            r.notes.unload();
+            r.show_page();
+        });
+        // ↓ and ↑ go to the next and previous paragraph, like the buttons, as
+        // long as the cursor is not in the notes or in a field to type in.
+        let arrows = gtk::EventControllerKey::new();
+        arrows.set_propagation_phase(gtk::PropagationPhase::Capture);
+        self.window.add_controller(arrows.clone());
+        let weak = Rc::downgrade(self);
+        arrows.connect_key_pressed(move |_, key, _, modifiers| {
+            let Some(r) = weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            let forward = match key {
+                gtk::gdk::Key::Down => true,
+                gtk::gdk::Key::Up => false,
+                _ => return glib::Propagation::Proceed,
+            };
+            let typing = gtk::prelude::GtkWindowExt::focus(&r.window)
+                .is_some_and(|w| w.is::<gtk::Text>() || w.is::<gtk::TextView>());
+            if !r.notes.widget.is_visible()
+                || typing
+                || modifiers.intersects(
+                    gtk::gdk::ModifierType::CONTROL_MASK
+                        | gtk::gdk::ModifierType::ALT_MASK
+                        | gtk::gdk::ModifierType::SHIFT_MASK
+                        | gtk::gdk::ModifierType::SUPER_MASK,
+                )
+            {
+                return glib::Propagation::Proceed;
+            }
+            r.notes.jump(forward);
+            glib::Propagation::Stop
+        });
+
+        let weak = Rc::downgrade(self);
+        self.notes_button.connect_clicked(move |_| {
+            let Some(r) = weak.upgrade() else { return };
+            if r.notes.is_loaded() {
+                r.notes.unload();
+                r.show_page();
+            } else {
+                let path = r
+                    .notes
+                    .last_path()
+                    .unwrap_or_else(crate::notes::fresh_notes);
+                r.open_notes(&path);
+            }
+        });
+
         let weak = Rc::downgrade(self);
         self.button.connect_clicked(move |_| {
             let Some(r) = weak.upgrade() else { return };
@@ -1122,6 +1443,28 @@ impl Recorder {
         // Ctrl+Q goes through the same check as the close button.
 
         let weak = Rc::downgrade(self);
+        self.webcam_row.connect_active_notify(move |row| {
+            if let Some(r) = weak.upgrade() {
+                settings::save_webcam_on(row.is_active());
+                if let Some((_, name)) = &r.webcam_camera {
+                    settings::save_webcam(name);
+                }
+                // During a recording the camera joins or leaves; black fills where it was off.
+                if r.state.get() == State::Recording {
+                    let device = r.selected_webcam().map(|(device, _)| device);
+                    r.webcam.switch(device.as_deref());
+                    if device.is_some() && !r.paused.get() {
+                        let this = r.clone();
+                        glib::spawn_future_local(async move {
+                            this.webcam.first_frame(Duration::from_secs(5)).await;
+                        });
+                    }
+                }
+                r.update_preview();
+            }
+        });
+
+        let weak = Rc::downgrade(self);
         self.format_row.connect_selected_notify(move |_| {
             if let Some(r) = weak.upgrade()
                 && !r.loading.get()
@@ -1230,7 +1573,7 @@ impl Recorder {
             if let Some(r) = weak.upgrade()
                 && r.title_row.text() != row.text()
             {
-                r.title_row.set_text(&row.text());
+                set_name(&r.title_row, &row.text());
             }
         });
         let weak = Rc::downgrade(self);
@@ -1420,12 +1763,62 @@ impl Recorder {
         self.add_actions_button.set_visible(actions.is_empty());
     }
 
-    /// Runs one of your actions on this meeting, off the main thread, and says
-    /// how it went; a link it printed gets an Open button.
+    /// Runs one of your actions on this meeting from the menu.
     fn run_action(self: &Rc<Self>, index: usize) {
         let Some(action) = crate::actions::load().into_iter().nth(index) else {
             return;
         };
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            this.perform(action).await;
+        });
+    }
+
+    /// Runs the actions marked `auto = true` on the meeting they are due for,
+    /// one after the other in the order of the config file. They are due once
+    /// its transcript is done, and its chapters when an agent writes them. A
+    /// window that has moved on to another meeting meanwhile leaves them. A
+    /// window closed while it was busy closes once they are done.
+    fn run_automatic_actions(self: &Rc<Self>) {
+        let Some(due) = self.auto_actions_due.borrow_mut().take() else {
+            return;
+        };
+        let actions = crate::actions::automatic();
+        if actions.is_empty() || !self.showing(&due) {
+            self.close_if_asked();
+            return;
+        }
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            for action in actions {
+                if !this.showing(&due) {
+                    break;
+                }
+                this.perform(action).await;
+            }
+            this.close_if_asked();
+        });
+    }
+
+    /// Whether the done page shows `dir`: the same meeting, also after a
+    /// rename, which keeps the timestamp the folder name starts with.
+    fn showing(&self, dir: &std::path::Path) -> bool {
+        let prefix = |p: &std::path::Path| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.chars().take(12).collect::<String>())
+        };
+        self.state.get() == State::Done
+            && self
+                .result_dir
+                .borrow()
+                .as_deref()
+                .is_some_and(|current| prefix(current) == prefix(dir))
+    }
+
+    /// Runs `action` on this meeting off the main thread and says how it went;
+    /// a link it printed gets an Open button. Returns once the action is done.
+    async fn perform(self: &Rc<Self>, action: crate::actions::Action) {
         let (Some(dir), Some(manifest)) = (
             self.result_dir.borrow().clone(),
             self.manifest.borrow().clone(),
@@ -1444,40 +1837,37 @@ impl Recorder {
         std::thread::spawn(move || {
             let _ = tx.send_blocking(crate::actions::run(&action, &folder, &manifest));
         });
-        let this = self.clone();
-        glib::spawn_future_local(async move {
-            let result = rx.recv().await;
-            running.dismiss();
-            // The action may have edited the meeting: show what is on disk now.
-            if crate::actions::fingerprint(&dir) != before {
-                this.reload_meeting(&dir);
+        let result = rx.recv().await;
+        running.dismiss();
+        // The action may have edited the meeting: show what is on disk now.
+        if crate::actions::fingerprint(&dir) != before {
+            self.reload_meeting(&dir);
+        }
+        let Ok(result) = result else { return };
+        let toast = match result {
+            Ok(outcome) => {
+                let toast = adw::Toast::new(&outcome.message);
+                toast.set_use_markup(false);
+                if let Some(url) = outcome.url {
+                    toast.set_button_label(Some("Open"));
+                    toast.set_timeout(15);
+                    toast.connect_button_clicked(move |_| {
+                        let _ = gio::AppInfo::launch_default_for_uri(
+                            &url,
+                            None::<&gio::AppLaunchContext>,
+                        );
+                    });
+                }
+                toast
             }
-            let Ok(result) = result else { return };
-            let toast = match result {
-                Ok(outcome) => {
-                    let toast = adw::Toast::new(&outcome.message);
-                    toast.set_use_markup(false);
-                    if let Some(url) = outcome.url {
-                        toast.set_button_label(Some("Open"));
-                        toast.set_timeout(15);
-                        toast.connect_button_clicked(move |_| {
-                            let _ = gio::AppInfo::launch_default_for_uri(
-                                &url,
-                                None::<&gio::AppLaunchContext>,
-                            );
-                        });
-                    }
-                    toast
-                }
-                Err(why) => {
-                    let toast = adw::Toast::new(&format!("{name} failed: {why}"));
-                    toast.set_use_markup(false);
-                    toast.set_timeout(10);
-                    toast
-                }
-            };
-            this.toasts.add_toast(toast);
-        });
+            Err(why) => {
+                let toast = adw::Toast::new(&format!("{name} failed: {why}"));
+                toast.set_use_markup(false);
+                toast.set_timeout(10);
+                toast
+            }
+        };
+        self.toasts.add_toast(toast);
     }
 
     /// Reads the meeting on the done page again after something else changed
@@ -1489,8 +1879,8 @@ impl Recorder {
         let Some((_, manifest)) = meeting::open(dir) else {
             return;
         };
-        self.done_title_row.set_text(&manifest.title);
-        self.title_row.set_text(&manifest.title);
+        set_name(&self.done_title_row, &manifest.title);
+        set_name(&self.title_row, &manifest.title);
         *self.manifest.borrow_mut() = Some(manifest);
         if let Ok(text) = std::fs::read_to_string(dir.join("transcript.md")) {
             self.redraw_transcript(&text);
@@ -1553,7 +1943,126 @@ impl Recorder {
         }
     }
 
+    /// The meeting's folder for the bar widget and `wait`, "" before it has one.
+    fn folder_text(&self) -> String {
+        self.result_dir
+            .borrow()
+            .as_ref()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_default()
+    }
+
+    /// Once the window is on screen: its own Hyprland window is the one of
+    /// this process that no other window of the app has claimed yet.
+    fn learn_hypr_address(self: &Rc<Self>) {
+        if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none() {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        self.window.connect_map(move |_| {
+            let weak = weak.clone();
+            glib::timeout_add_local_once(Duration::from_millis(300), move || {
+                let Some(r) = weak.upgrade() else { return };
+                let Some(hub) = r.hub.upgrade() else { return };
+                let taken: Vec<String> = hub
+                    .recorders()
+                    .iter()
+                    .filter_map(|other| other.hypr_address.borrow().clone())
+                    .collect();
+                let clients = hyprctl_json("clients");
+                let unclaimed = clients
+                    .as_ref()
+                    .and_then(|c| c.as_array())
+                    .and_then(|clients| unclaimed_window(clients, std::process::id(), &taken));
+                *r.hypr_address.borrow_mut() = unclaimed;
+            });
+        });
+    }
+
+    /// The preview shows the camera while the toggle is on and the recording
+    /// page is on screen; a paused recording leaves its last frame, dimmed.
+    /// Nowhere else is the camera on.
+    fn update_preview(&self) {
+        let on = self.webcam_camera.is_some() && self.webcam_row.is_active();
+        let on_page =
+            !self.compact.get() && self.layout.visible_child_name().as_deref() == Some("record");
+        self.webcam_preview.set_visible(on);
+        self.webcam_preview
+            .set_opacity(if self.paused.get() { 0.4 } else { 1.0 });
+        if !on {
+            self.webcam_preview
+                .set_paintable(None::<&gtk::gdk::Paintable>);
+        }
+        if matches!(self.state.get(), State::Idle | State::Done) {
+            let device = self
+                .webcam_camera
+                .as_ref()
+                .map(|(device, _)| device.as_path());
+            self.webcam.preview(device.filter(|_| on && on_page));
+        }
+    }
+
+    /// The camera to record, as (device, name); None when the toggle is off.
+    fn selected_webcam(&self) -> Option<(PathBuf, String)> {
+        self.webcam_camera
+            .clone()
+            .filter(|_| self.webcam_row.is_active())
+    }
+
+    /// Opens the notes in `path` next to the recording page.
+    fn open_notes(&self, path: &std::path::Path) {
+        if self.notes.load(path) {
+            self.show_page();
+        }
+    }
+
+    /// With notes open on the recording page they sit next to
+    /// the recorder, which keeps its own width. Returns whether it is on screen.
+    fn arrange_notes(&self) -> bool {
+        let page = if self.compact.get() {
+            None
+        } else {
+            self.layout.visible_child_name()
+        };
+        let recording_page = page.as_deref() == Some("record");
+        let done_page = page.as_deref() == Some("done");
+        let shown = (recording_page || done_page) && self.notes.is_loaded();
+        self.notes_button.set_visible(recording_page);
+        self.notes.widget.set_visible(shown);
+        // Next to the recorder the notes take the room; next to a transcript, the transcript does.
+        let beside_recorder = shown && recording_page;
+        self.view.set_hexpand(!beside_recorder);
+        self.view
+            .set_size_request(if beside_recorder { FULL_SIZE.0 } else { -1 }, -1);
+        self.notes.widget.set_hexpand(beside_recorder);
+        self.notes.widget.set_size_request(
+            if shown && done_page {
+                DONE_NOTES_WIDTH
+            } else {
+                -1
+            },
+            -1,
+        );
+        self.update_preview();
+        shown
+    }
+
+    /// The done page shows the notes the meeting was recorded with, when it has any.
+    fn show_meeting_notes(&self, dir: &std::path::Path) {
+        let file = dir.join(crate::notes::NOTES_FILE);
+        if file.exists() && self.notes.load(&file) {
+            self.showing_meeting_notes.set(true);
+        } else if self.showing_meeting_notes.replace(false) || self.notes.is_loaded() {
+            self.notes.unload();
+        }
+        self.show_page();
+    }
+
     fn set_state(&self, state: State) {
+        // The bar lives on the done page. Leave it behind with the page.
+        if state != State::Done {
+            self.dismiss_find();
+        }
         self.state.set(state);
         let mut shared = self.shared.lock().unwrap();
         shared.state = if state == State::Recording && self.paused.get() {
@@ -1572,6 +2081,7 @@ impl Recorder {
         if state != State::Transcribing {
             shared.progress = 0.0;
         }
+        shared.folder = self.folder_text();
         drop(shared);
         self.render();
     }
@@ -1579,12 +2089,16 @@ impl Recorder {
     fn render(&self) {
         let state = self.state.get();
         let recording = state == State::Recording;
-        self.live.set(recording);
+        self.webcam_row.set_sensitive(
+            self.webcam_camera.is_some()
+                && matches!(state, State::Idle | State::Done | State::Recording),
+        );
         self.dot.set_visible(recording);
         self.compact_button.set_visible(recording);
         self.cancel_button.set_visible(state == State::Transcribing);
         self.settings_button
             .set_visible(!matches!(state, State::Stopping | State::Transcribing));
+        self.find_button.set_visible(state == State::Done);
         self.compact_action.set_enabled(recording);
         self.language_row
             .set_sensitive(!matches!(state, State::Stopping | State::Transcribing));
@@ -1661,8 +2175,14 @@ impl Recorder {
             _ => "record",
         };
         self.layout.set_visible_child_name(page);
+        let prompting = self.arrange_notes();
         // Recording and transcribing share one size, so stopping does not jump.
-        self.fit_window(if page == "done" { DONE_SIZE } else { FULL_SIZE });
+        self.fit_window(match (page, prompting) {
+            ("done", true) => DONE_NOTES_SIZE,
+            ("done", false) => DONE_SIZE,
+            ("record", true) => NOTES_SIZE,
+            _ => FULL_SIZE,
+        });
         let immersive =
             matches!(state, State::Stopping | State::Transcribing) && self.transcribing.animates();
         self.view.set_extend_content_to_top_edge(immersive);
@@ -1682,14 +2202,20 @@ impl Recorder {
         }
         let minimum = if size == DONE_SIZE {
             (820, 560)
+        } else if size == DONE_NOTES_SIZE {
+            (820 + DONE_NOTES_WIDTH, 560)
+        } else if size == NOTES_SIZE {
+            (900, 600)
         } else {
             (360, 200)
         };
+        let current = (self.window.width(), self.window.height());
         self.window.set_size_request(minimum.0, minimum.1);
         self.window.set_default_size(size.0, size.1);
         self.window.queue_resize();
+        let address = self.hypr_address.borrow().clone();
         glib::timeout_add_local_once(Duration::from_millis(50), move || {
-            hyprland_resize(size);
+            hyprland_resize(size, current, address);
         });
     }
 
@@ -1723,6 +2249,7 @@ impl Recorder {
                 self.full_size.set((w, h));
             }
             self.layout.set_visible_child_name("compact");
+            self.arrange_notes();
             self.view.set_reveal_top_bars(false);
             // libadwaita keeps every window at least 360x200 unless told otherwise.
             self.window.set_size_request(COMPACT_SIZE.0, COMPACT_SIZE.1);
@@ -1733,12 +2260,14 @@ impl Recorder {
             self.window.set_size_request(360, 200);
             self.full_size.get()
         };
+        let current = (self.window.width(), self.window.height());
         self.window.set_default_size(size.0, size.1);
         self.window.queue_resize();
         // A compositor may ignore a client asking to change the size of a
         // window that is already on screen; on Hyprland, ask it directly.
+        let address = self.hypr_address.borrow().clone();
         glib::timeout_add_local_once(Duration::from_millis(50), move || {
-            hyprland_resize(size);
+            hyprland_resize(size, current, address);
         });
     }
 
@@ -1752,20 +2281,42 @@ impl Recorder {
         (until - self.started_at.get() - self.paused_secs.get()).max(0)
     }
 
-    fn toggle_pause(&self) {
-        if self.state.get() != State::Recording {
+    fn toggle_pause(self: &Rc<Self>) {
+        if self.state.get() != State::Recording || self.starting.get() {
             return;
         }
-        if self.paused.get() {
-            self.paused_secs
-                .set(self.paused_secs.get() + ipc::now() - self.pause_began.get());
-            self.paused.set(false);
-        } else {
+        if !self.paused.get() {
+            self.webcam.audio_paused();
             self.pause_began.set(ipc::now());
             self.paused.set(true);
+            self.mic.set_paused(true);
+            self.system.set_paused(true);
+            self.after_pause_change();
+            return;
         }
-        self.mic.set_paused(self.paused.get());
-        self.system.set_paused(self.paused.get());
+        // Resuming: with the camera on, the audio waits for its first frame again.
+        self.webcam.resume();
+        self.starting.set(true);
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            this.webcam.first_frame(Duration::from_secs(3)).await;
+            this.starting.set(false);
+            // Stopped while the camera came back: nothing to resume.
+            if this.state.get() != State::Recording || !this.paused.get() {
+                return;
+            }
+            this.paused_secs
+                .set(this.paused_secs.get() + ipc::now() - this.pause_began.get());
+            this.paused.set(false);
+            this.mic.set_paused(false);
+            this.system.set_paused(false);
+            this.webcam.audio_started();
+            this.after_pause_change();
+        });
+    }
+
+    fn after_pause_change(&self) {
+        self.update_preview();
         self.freeze_meters(self.paused.get());
         self.set_state(State::Recording);
         self.tick();
@@ -1858,7 +2409,7 @@ impl Recorder {
         }
 
         self.player.unload();
-        self.title_row.set_text(&title);
+        set_name(&self.title_row, &title);
         self.started_at.set(started_at);
         *self.result_dir.borrow_mut() = Some(out.clone());
         *self.manifest.borrow_mut() = Some(Manifest {
@@ -2070,8 +2621,8 @@ impl Recorder {
             format: settings::load_format(),
             language: settings::load_language(),
         });
-        self.title_row.set_text(&note.title);
         self.loading.set(true);
+        set_name(&self.title_row, &note.title);
         if let Some(i) = Format::ALL.iter().position(|f| *f == note.format) {
             self.format_row.set_selected(i as u32);
         }
@@ -2202,9 +2753,16 @@ impl Recorder {
         self.player.unload();
         *self.result_dir.borrow_mut() = None;
         *self.manifest.borrow_mut() = None;
-        self.title_row.set_text("");
+        set_name(&self.title_row, "");
         self.timer.set_label("00:00");
         self.compact_timer.set_label("00:00");
+        // The meeting's notes stay with the meeting; the ones recorded with come back.
+        if self.showing_meeting_notes.replace(false) {
+            self.notes.unload();
+            if let Some(live) = self.live_notes.borrow().clone() {
+                self.notes.load(&live);
+            }
+        }
         self.set_state(State::Idle);
         self.update_model_banner();
     }
@@ -2217,31 +2775,62 @@ impl Recorder {
             self.toast("Another window is recording");
             return;
         }
+        if self.starting.get() {
+            return;
+        }
         // A name typed before starting is kept; otherwise one from the time.
         if self.title_row.text().trim().is_empty() {
             let title = glib::DateTime::now_local()
                 .and_then(|now| now.format("Meeting %H:%M"))
                 .map(|s| s.to_string())
                 .unwrap_or_else(|_| "Meeting".to_owned());
-            self.title_row.set_text(&title);
+            set_name(&self.title_row, &title);
         }
         self.paused.set(false);
         self.paused_secs.set(0);
         self.pause_began.set(0);
-        let started_at = ipc::now();
         let staging = glib::user_cache_dir()
             .join(APP_NAME)
-            .join(started_at.to_string());
-        if let Err(e) = std::fs::create_dir_all(&staging)
-            .and_then(|_| self.mic.start_recording(&staging.join("mic.raw")))
-            .and_then(|_| self.system.start_recording(&staging.join("system.raw")))
-        {
-            self.mic.stop_recording();
-            self.system.stop_recording();
+            .join(ipc::now().to_string());
+        if let Err(e) = std::fs::create_dir_all(&staging) {
             self.status_label
                 .set_label(&format!("Could not start recording: {e}"));
             return;
         }
+        let camera = self.selected_webcam().map(|(device, _)| device);
+        self.webcam.begin(&staging, camera.as_deref());
+        if camera.is_none() {
+            self.start_audio(staging);
+            return;
+        }
+        // The audio waits for the camera's first frame, so the two start together.
+        self.starting.set(true);
+        self.button.set_sensitive(false);
+        self.status_label.set_label("Starting the camera…");
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            this.webcam.first_frame(Duration::from_secs(3)).await;
+            this.starting.set(false);
+            this.button.set_sensitive(true);
+            this.start_audio(staging);
+        });
+    }
+
+    fn start_audio(self: &Rc<Self>, staging: PathBuf) {
+        let started_at = ipc::now();
+        if let Err(e) = self
+            .mic
+            .start_recording(&staging.join("mic.raw"))
+            .and_then(|_| self.system.start_recording(&staging.join("system.raw")))
+        {
+            self.mic.stop_recording();
+            self.system.stop_recording();
+            let _ = self.webcam.end();
+            self.status_label
+                .set_label(&format!("Could not start recording: {e}"));
+            return;
+        }
+        self.webcam.audio_started();
         write_recording_note(
             &staging,
             &self.title(),
@@ -2271,6 +2860,7 @@ impl Recorder {
         self.animation_since.set(Some(std::time::Instant::now()));
         self.mic.stop_recording();
         self.system.stop_recording();
+        let webcam = self.webcam.end();
         let Some(staging) = self.staging.borrow().clone() else {
             return;
         };
@@ -2284,6 +2874,11 @@ impl Recorder {
         let format = self.selected_format();
         let language = self.selected_language();
         let out = meeting_folder(self.started_at.get(), &self.title());
+        // The notes read from, as they stood when the recording stopped.
+        let script = self.notes.text();
+        if !self.showing_meeting_notes.get() {
+            *self.live_notes.borrow_mut() = self.notes.path();
+        }
         let this = self.clone();
         glib::spawn_future_local(async move {
             let (audio_out, audio_staging) = (out.clone(), staging.clone());
@@ -2295,6 +2890,7 @@ impl Recorder {
                 );
                 let audio = export_audio(&mic, &system, &audio_out, format);
                 let tracks = export_tracks(&mic, &system, &audio_out);
+                crate::webcam::export(&audio_staging, &audio_out, webcam);
                 (audio, tracks)
             })
             .await
@@ -2318,6 +2914,9 @@ impl Recorder {
                 partial: false,
             };
             let _ = meeting::write(&out, &manifest);
+            if let Some(script) = script {
+                let _ = std::fs::write(out.join(crate::notes::NOTES_FILE), script);
+            }
             *this.manifest.borrow_mut() = Some(manifest);
             *this.result_dir.borrow_mut() = Some(out);
 
@@ -2466,6 +3065,10 @@ impl Recorder {
                             if let Some(name) = known.get(label) {
                                 return name.clone();
                             }
+                            // One voice where there were several: the name of the first.
+                            if let Some(name) = known.get(&format!("{label} 1")) {
+                                return name.clone();
+                            }
                             match meeting::side_of(label) {
                                 // The first voice on the mic is you.
                                 Some((side, 1)) => {
@@ -2527,8 +3130,11 @@ impl Recorder {
     }
 
     fn finished(self: &Rc<Self>, audio_ok: bool, transcript: Result<(), String>) {
-        self.done_title_row.set_text(&self.title_row.text());
+        set_name(&self.done_title_row, &self.title_row.text());
         self.set_state(State::Done);
+        if let Some(dir) = self.result_dir.borrow().clone() {
+            self.show_meeting_notes(&dir);
+        }
         // Follow a name that was edited while the transcription ran.
         self.apply_title();
 
@@ -2550,17 +3156,35 @@ impl Recorder {
         }
         self.show_transcript(text.as_deref(), problem.as_deref());
         self.transcript_scroll.vadjustment().set_value(0.0);
+        let actions_follow = problem.is_none() && !crate::actions::automatic().is_empty();
         if let Some(problem) = problem {
             eprintln!("{APP_NAME}: {problem}");
         } else {
             self.window.set_default_widget(Some(&self.copy_button));
             self.copy_button.grab_focus();
+            // Your automatic actions run on a fresh transcript, after the
+            // chapters when there are any, so they see the whole meeting. A
+            // partial one is a fraction of the meeting, not a finished one.
+            if actions_follow && !self.is_partial() {
+                *self.auto_actions_due.borrow_mut() = self.result_dir.borrow().clone();
+            }
             // A fresh transcript gets chapters when an agent is around; a
             // partial one is a fraction of the meeting and not worth the call.
             if !self.is_partial() && self.can_have_chapters() {
                 self.generate_chapters();
+            } else {
+                self.run_automatic_actions();
             }
         }
+        // A window closed while busy goes now, or once its automatic actions
+        // are done: quitting first would kill them halfway or before they start.
+        if !actions_follow {
+            self.close_if_asked();
+        }
+    }
+
+    /// Closes a window that was closed while it was busy, now that it is done.
+    fn close_if_asked(self: &Rc<Self>) {
         if self.quit_when_done.get()
             && let Some(app) = self.window.application()
         {
@@ -2649,11 +3273,12 @@ impl Recorder {
         self.loading.set(false);
 
         self.started_at.set(manifest.started_at);
-        self.title_row.set_text(&manifest.title);
-        self.done_title_row.set_text(&manifest.title);
+        set_name(&self.title_row, &manifest.title);
+        set_name(&self.done_title_row, &manifest.title);
         *self.manifest.borrow_mut() = Some(manifest);
         *self.result_dir.borrow_mut() = Some(dir.clone());
         self.set_state(State::Done);
+        self.show_meeting_notes(&dir);
         let text = std::fs::read_to_string(dir.join("transcript.md")).ok();
         let problem = text
             .is_none()
@@ -2727,8 +3352,11 @@ impl Recorder {
             .as_ref()
             .map(|m| m.chapters.clone())
             .unwrap_or_default();
+        // One string per row, in the same order as the list, so a hit is a row.
+        let mut search_rows = Vec::new();
         for note in &notes {
             self.transcript_list.append(&note_row(note));
+            search_rows.push(note.clone());
         }
         // The speaker column is as wide as the longest name.
         let speaker_width = paragraphs
@@ -2752,6 +3380,7 @@ impl Recorder {
                 let row = chapter_row(&chapter.title, chapter.start_ms);
                 segments.push((row_count(&self.transcript_list), chapter.start_ms));
                 self.transcript_list.append(&row);
+                search_rows.push(chapter.title.clone());
             }
             let index = order
                 .iter()
@@ -2760,6 +3389,7 @@ impl Recorder {
             let row = self.paragraph_row(&paragraph, index, time_width, speaker_width);
             segments.push((row_count(&self.transcript_list), paragraph.start_ms));
             self.transcript_list.append(&row);
+            search_rows.push(format!("{} {}", paragraph.speaker, paragraph.text));
             lines.push((paragraph.start_ms, paragraph.speaker, paragraph.text));
         }
         if let Some(manifest) = self.manifest.borrow().as_ref() {
@@ -2767,6 +3397,11 @@ impl Recorder {
         }
         *self.segments.borrow_mut() = segments;
         *self.lines.borrow_mut() = lines;
+        *self.search_rows.borrow_mut() = search_rows;
+        // An edit rebuilds the list. Keep the bar on the same line if it can.
+        if self.find_bar.is_visible() {
+            self.apply_find(false);
+        }
         self.player.set_chapters(
             chapters
                 .iter()
@@ -2847,10 +3482,12 @@ impl Recorder {
     /// works the same without them; a failure only shows up in the header.
     fn generate_chapters(self: &Rc<Self>) {
         if self.generating.get() {
+            self.run_automatic_actions();
             return;
         }
         let (Some(agent), Some(dir)) = (self.default_agent(), self.result_dir.borrow().clone())
         else {
+            self.run_automatic_actions();
             return;
         };
         let lines = self.lines.borrow().clone();
@@ -2882,6 +3519,7 @@ impl Recorder {
             };
             let current = this.result_dir.borrow().clone();
             let Some(dir) = current.filter(|d| prefix(d) == prefix(&dir)) else {
+                this.run_automatic_actions();
                 return;
             };
             match result {
@@ -2893,6 +3531,9 @@ impl Recorder {
                         .set_description(Some(&format!("{} could not make chapters", agent.name)));
                 }
             }
+            // With or without chapters, the meeting is now as complete as it
+            // gets: the automatic actions can have it.
+            this.run_automatic_actions();
         });
     }
 
@@ -3213,7 +3854,7 @@ impl Recorder {
             .manifest
             .borrow()
             .as_ref()
-            .map(|m| m.speakers.clone())
+            .map(|m| m.people())
             .unwrap_or_default();
         if speakers.len() < 2 {
             return;
@@ -3231,6 +3872,142 @@ impl Recorder {
                 {
                     *line = format!("**[{time}] {other}:** {text}");
                 }
+            }
+        });
+    }
+
+    /// Ctrl+F on the done page: show the bar and select whatever was typed last.
+    fn open_find(&self) {
+        if self.state.get() != State::Done {
+            return;
+        }
+        let opening = !self.find_bar.is_visible();
+        self.find_bar.set_visible(true);
+        self.find_entry.grab_focus();
+        self.find_entry.select_region(0, -1);
+        if opening {
+            self.apply_find(false);
+        }
+    }
+
+    /// Hides the bar and the marks. The query stays, so the next Ctrl+F continues it.
+    fn close_find(&self) {
+        self.dismiss_find();
+        if self.state.get() == State::Done {
+            // Back to the copy button: focus in the name field would rename the meeting.
+            self.copy_button.grab_focus();
+        }
+    }
+
+    fn dismiss_find(&self) {
+        if !self.find_bar.is_visible() {
+            return;
+        }
+        self.find_bar.set_visible(false);
+        self.clear_find_marks();
+    }
+
+    /// Marks every row that contains the query. `jump_to_first` is for a new
+    /// query; a rebuilt transcript keeps the row it was on.
+    fn apply_find(&self, jump_to_first: bool) {
+        let keep = self.find_hits.borrow().get(self.find_at.get()).copied();
+        self.clear_find_marks();
+        let query = self.find_entry.text();
+        let hits = crate::find::hits(self.search_rows.borrow().as_slice(), query.as_str());
+        let count = hits.len();
+        let at = if count == 0 || jump_to_first {
+            0
+        } else if let Some(row) = keep {
+            hits.iter().position(|hit| *hit == row).unwrap_or(0)
+        } else {
+            0
+        };
+        for index in &hits {
+            if let Some(row) = self.transcript_list.row_at_index(*index) {
+                row.add_css_class("match");
+            }
+        }
+        *self.find_hits.borrow_mut() = hits;
+        *self.find_query.borrow_mut() = query.trim().to_owned();
+        self.find_at.set(at);
+        let any = count > 0;
+        self.find_prev.set_sensitive(any);
+        self.find_next.set_sensitive(any);
+        if query.trim().is_empty() {
+            self.find_count.set_label("");
+            return;
+        }
+        if count == 0 {
+            self.find_count.set_label("No matches");
+            return;
+        }
+        self.show_hit(at);
+    }
+
+    /// Next or previous match. A query that has not been applied yet jumps
+    /// to its first match instead of stepping past it.
+    fn find_again(&self, delta: i32) {
+        let query = self.find_entry.text();
+        if query.trim() != self.find_query.borrow().as_str() {
+            self.apply_find(true);
+            return;
+        }
+        self.find_step(delta);
+    }
+
+    /// Moves to another match. `delta` is 1 or -1, and wraps around.
+    fn find_step(&self, delta: i32) {
+        let count = self.find_hits.borrow().len() as i32;
+        if count == 0 {
+            return;
+        }
+        let at = (self.find_at.get() as i32 + delta).rem_euclid(count) as usize;
+        self.show_hit(at);
+    }
+
+    fn show_hit(&self, at: usize) {
+        let hits = self.find_hits.borrow().clone();
+        if let Some(row) = hits
+            .get(self.find_at.get())
+            .and_then(|index| self.transcript_list.row_at_index(*index))
+        {
+            row.remove_css_class("found");
+        }
+        self.find_at.set(at);
+        let Some(&index) = hits.get(at) else {
+            return;
+        };
+        self.find_count
+            .set_label(&format!("{} of {}", at + 1, hits.len()));
+        if let Some(row) = self.transcript_list.row_at_index(index) {
+            row.add_css_class("found");
+            self.scroll_row_into_view(&row);
+        }
+    }
+
+    fn clear_find_marks(&self) {
+        for index in self.find_hits.borrow().clone() {
+            if let Some(row) = self.transcript_list.row_at_index(index) {
+                row.remove_css_class("match");
+                row.remove_css_class("found");
+            }
+        }
+    }
+
+    /// Brings `row` into the transcript, a third of the way down, once it has a size.
+    fn scroll_row_into_view(&self, row: &gtk::ListBoxRow) {
+        let row = row.clone();
+        let list = self.transcript_list.clone();
+        let scroll = self.transcript_scroll.clone();
+        glib::idle_add_local_once(move || {
+            let Some(bounds) = row.compute_bounds(&list) else {
+                return;
+            };
+            let adjustment = scroll.vadjustment();
+            let (top, page) = (adjustment.value(), adjustment.page_size());
+            let (y, height) = (f64::from(bounds.y()), f64::from(bounds.height()));
+            if y < top || y + height > top + page {
+                adjustment.set_value((y - page * 0.3).max(0.0));
             }
         });
     }
@@ -3284,7 +4061,8 @@ impl Recorder {
         }
     }
 
-    /// One name row per speaker under the meeting name.
+    /// One name row per person under the meeting name. Speakers given the same
+    /// name share a row: that is how two voices that were one person are merged.
     fn show_speakers(self: &Rc<Self>) {
         for row in self.speaker_rows.borrow_mut().drain(..) {
             self.done_group.remove(&row);
@@ -3294,7 +4072,12 @@ impl Recorder {
         };
         let mut rows = Vec::new();
         let labels = manifest.default_labels();
-        for (i, name) in manifest.speakers.iter().enumerate() {
+        for name in manifest.people() {
+            let i = manifest
+                .speakers
+                .iter()
+                .position(|s| *s == name)
+                .unwrap_or(0);
             let side = labels.get(i).and_then(|l| meeting::side_of(l));
             let title = match (manifest.imported.is_some(), side) {
                 (true, _) | (false, None) => format!("Speaker {}", i + 1),
@@ -3313,7 +4096,7 @@ impl Recorder {
             };
             let row = adw::EntryRow::builder()
                 .title(title)
-                .text(name)
+                .text(&name)
                 .show_apply_button(true)
                 .build();
             let weak = Rc::downgrade(self);
@@ -3337,8 +4120,9 @@ impl Recorder {
         *self.speaker_rows.borrow_mut() = rows;
     }
 
-    /// Renames the speakers in transcript.md and the manifest. Your own name is
-    /// also remembered for the next recordings.
+    /// Renames the speakers in transcript.md and the manifest. A name that
+    /// another speaker already has merges the two. Your own name is also
+    /// remembered for the next recordings.
     fn apply_speakers(self: &Rc<Self>) {
         if self.state.get() != State::Done {
             return;
@@ -3350,41 +4134,42 @@ impl Recorder {
             return;
         };
         let labels = manifest.default_labels();
-        let names: Vec<String> = self
+        let people = manifest.people();
+        let typed: Vec<String> = self
             .speaker_rows
             .borrow()
             .iter()
+            .map(|row| row.text().trim().replace(['*', '[', ']', ':', '\n'], ""))
+            .collect();
+        if typed.len() != people.len() {
+            return;
+        }
+        let names: Vec<String> = manifest
+            .speakers
+            .iter()
             .enumerate()
-            .map(|(i, row)| {
-                let text = row.text().trim().replace(['*', '[', ']', ':', '\n'], "");
-                if text.is_empty() {
+            .map(|(i, name)| {
+                let row = people.iter().position(|p| p == name).unwrap_or(0);
+                if typed[row].is_empty() {
                     labels
                         .get(i)
                         .cloned()
                         .unwrap_or_else(|| format!("Speaker {}", i + 1))
                 } else {
-                    text
+                    typed[row].clone()
                 }
             })
             .collect();
         if names.is_empty() || names == manifest.speakers {
             return;
         }
-        let mut unique = names.clone();
-        unique.sort();
-        unique.dedup();
-        if unique.len() != names.len() {
-            self.toast("Every speaker needs a different name");
-            self.show_speakers();
-            return;
+        let merged = names.iter().collect::<std::collections::HashSet<_>>().len() < people.len();
+        let mut renames: Vec<(String, String)> = Vec::new();
+        for (from, to) in manifest.speakers.iter().zip(&names) {
+            if from != to && !renames.iter().any(|(f, _)| f == from) {
+                renames.push((from.clone(), to.clone()));
+            }
         }
-        let renames: Vec<(String, String)> = manifest
-            .speakers
-            .iter()
-            .cloned()
-            .zip(names.iter().cloned())
-            .filter(|(from, to)| from != to)
-            .collect();
         let transcript = dir.join("transcript.md");
         if let Ok(text) = std::fs::read_to_string(&transcript) {
             let _ = std::fs::write(&transcript, meeting::relabel_all(&text, &renames));
@@ -3400,7 +4185,11 @@ impl Recorder {
         }
         let text = std::fs::read_to_string(&transcript).ok();
         self.redraw_transcript(text.as_deref().unwrap_or(""));
-        self.toast("Saved");
+        if merged {
+            self.toast("Merged into one speaker");
+        } else {
+            self.toast("Saved");
+        }
     }
 
     /// Renames the meeting folder after the name and rewrites the transcript heading.
@@ -3431,7 +4220,9 @@ impl Recorder {
                 self.toast(&format!("Could not rename the folder: {e}"));
                 return;
             }
+            self.player.relocate(&current, &target);
             *self.result_dir.borrow_mut() = Some(target.clone());
+            self.shared.lock().unwrap().folder = self.folder_text();
             self.render();
         }
         // The folder the meeting is in now: renamed, or the numbered one it had.
@@ -3641,7 +4432,9 @@ impl Paragraphs {
 
 /// Resizes this app's window through Hyprland, keeping it where it is.
 /// Does nothing outside Hyprland.
-fn hyprland_resize((width, height): (i32, i32)) {
+/// Resizes this window: the one at `address` when it is known, else the one
+/// that is `current` in size now. With more windows open, the others keep theirs.
+fn hyprland_resize((width, height): (i32, i32), current: (i32, i32), address: Option<String>) {
     if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none() {
         return;
     }
@@ -3650,7 +4443,10 @@ fn hyprland_resize((width, height): (i32, i32)) {
         // Right after start the window may not be mapped yet; wait for it a little.
         let mut window = None;
         for _ in 0..30 {
-            window = own_window(pid);
+            window = match &address {
+                Some(address) => client_at(address),
+                None => own_window(pid, current),
+            };
             if window.is_some() {
                 break;
             }
@@ -3666,7 +4462,7 @@ fn hyprland_resize((width, height): (i32, i32)) {
         // Hyprland grows a floating window around its centre; a strip that was
         // dragged into a corner would then stick out. Bring it back on screen.
         std::thread::sleep(std::time::Duration::from_millis(150));
-        if let Some((x, y)) = own_window(pid).and_then(|w| on_screen(&w)) {
+        if let Some((x, y)) = client_at(&address).and_then(|w| on_screen(&w)) {
             hyprctl_dispatch(&format!(
                 "hl.dsp.window.move({{ x = {x}, y = {y}, window = \"address:{address}\" }})"
             ));
@@ -3689,12 +4485,51 @@ fn hyprctl_dispatch(call: &str) {
         .output();
 }
 
-/// This process's floating window, as `hyprctl clients -j` describes it.
-fn own_window(pid: u32) -> Option<serde_json::Value> {
+/// This process's floating window that is `size` now, as `hyprctl clients -j`
+/// describes it.
+fn own_window(pid: u32, size: (i32, i32)) -> Option<serde_json::Value> {
+    pick_window(hyprctl_json("clients")?.as_array()?, pid, size).cloned()
+}
+
+/// Of this process's floating windows, the one of `size`; with more of that
+/// size, or none (a window not on screen yet), the one focused last.
+fn pick_window(
+    clients: &[serde_json::Value],
+    pid: u32,
+    size: (i32, i32),
+) -> Option<&serde_json::Value> {
+    let mut own: Vec<&serde_json::Value> = clients
+        .iter()
+        .filter(|c| c["pid"].as_u64() == Some(u64::from(pid)) && c["floating"] == true)
+        .collect();
+    own.sort_by_key(|c| c["focusHistoryID"].as_i64().unwrap_or(i64::MAX));
+    let sized = |c: &&&serde_json::Value| {
+        c["size"][0].as_i64() == Some(i64::from(size.0))
+            && c["size"][1].as_i64() == Some(i64::from(size.1))
+    };
+    own.iter().find(sized).or(own.first()).copied()
+}
+
+/// The first of this process's floating windows, most recently focused
+/// first, whose address is not in `taken`.
+fn unclaimed_window(clients: &[serde_json::Value], pid: u32, taken: &[String]) -> Option<String> {
+    let mut own: Vec<&serde_json::Value> = clients
+        .iter()
+        .filter(|c| c["pid"].as_u64() == Some(u64::from(pid)) && c["floating"] == true)
+        .collect();
+    own.sort_by_key(|c| c["focusHistoryID"].as_i64().unwrap_or(i64::MAX));
+    own.iter()
+        .filter_map(|c| c["address"].as_str())
+        .find(|address| !taken.iter().any(|t| t == address))
+        .map(str::to_owned)
+}
+
+/// A window by its Hyprland address.
+fn client_at(address: &str) -> Option<serde_json::Value> {
     hyprctl_json("clients")?
         .as_array()?
         .iter()
-        .find(|c| c["pid"].as_u64() == Some(u64::from(pid)) && c["floating"] == true)
+        .find(|c| c["address"].as_str() == Some(address))
         .cloned()
 }
 
@@ -3721,6 +4556,14 @@ fn on_screen(window: &serde_json::Value) -> Option<(i64, i64)> {
     let nx = x.min(right - w).max(left);
     let ny = y.min(bottom - h).max(top);
     (nx != x || ny != y).then_some((nx, ny))
+}
+
+/// Fills in a meeting name that nobody typed: without the apply button,
+/// which would ask to confirm a change that was never made.
+fn set_name(row: &adw::EntryRow, text: &str) {
+    row.set_show_apply_button(false);
+    row.set_text(text);
+    row.set_show_apply_button(true);
 }
 
 /// Repaints a widget and everything in it, for custom drawing after a theme switch.
@@ -3973,6 +4816,9 @@ fn load_css() {
          .transcript row { padding: 7px 10px; border-radius: 8px; }
          .transcript row:hover { background: alpha(currentColor, 0.06); }
          .transcript row.current { background: alpha(@accent_bg_color, 0.25); }
+         .transcript row.match { background: alpha(@accent_bg_color, 0.14); }
+         .transcript row.found { background: alpha(@accent_bg_color, 0.36);
+                                 box-shadow: inset 3px 0 0 @accent_color; }
          .transcript row.chapter { padding-top: 16px; }
          .transcript row.chapter:first-child { padding-top: 7px; }
          .chapter-heading { font-weight: 800; font-size: 1.08em; }
@@ -3987,7 +4833,22 @@ fn load_css() {
          .transcript-editor { background: alpha(currentColor, 0.06); border-radius: 6px; padding: 4px 6px; }
          .transcript-editor text { background: transparent; }
          .done-icon { color: @accent_color; }
-         .player { padding: 6px 14px 6px 6px; }",
+         .player { padding: 6px 14px 6px 6px; }
+         .notes { background: @window_bg_color; border-left: 1px solid alpha(currentColor, 0.1); }
+         .notes-toggle { min-height: 24px; min-width: 24px; padding: 0 6px; border-radius: 6px;
+                                border: 1px solid alpha(currentColor, 0.25); font-family: \"IBM Plex Mono\", \"JetBrainsMono Nerd Font\", monospace;
+                                font-size: 13px; color: alpha(currentColor, 0.6); }
+         .notes-toggle:hover { color: currentColor; }
+         .webcam-preview { border-radius: 6px; background: black; margin: 6px 4px 6px 0; }
+         .player-video { border-radius: 10px; background: black; }
+         .webcam-pip { border-radius: 10px; box-shadow: 0 10px 30px alpha(black, 0.45); }
+         .notes-text { font-family: \"IBM Plex Mono\", \"JetBrainsMono Nerd Font\", \"JetBrains Mono\", monospace;
+                              font-size: 21px; line-height: 1.6; background: transparent; caret-color: currentColor; }
+         .notes-text text { background: transparent; }
+         .notes-footer { font-family: \"IBM Plex Mono\", \"JetBrainsMono Nerd Font\", \"JetBrains Mono\", monospace;
+                                font-size: 11px; color: alpha(currentColor, 0.5); }
+         .notes-button { min-height: 26px; min-width: 26px; padding: 2px; color: alpha(currentColor, 0.5); }
+         .notes-button:hover { color: currentColor; }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
         gtk::style_context_add_provider_for_display(
@@ -4035,7 +4896,6 @@ fn meter(
     (key, fallback): (&'static str, (f64, f64, f64)),
     height: i32,
     frozen: &Frozen,
-    live: &Rc<Cell<bool>>,
 ) -> gtk::DrawingArea {
     let area = gtk::DrawingArea::builder()
         .content_height(height)
@@ -4043,49 +4903,10 @@ fn meter(
         .build();
     let source = source.clone();
     let frozen = frozen.clone();
-    let live = live.clone();
     area.set_draw_func(move |area, cr, width, height| {
         let (r, g, b) = crate::theme::color(key, fallback);
         let (width, height) = (f64::from(width), f64::from(height));
         let paused = frozen.borrow().is_some();
-        if !live.get() && !paused {
-            // Not recording yet: no moving wave, just a line that thickens
-            // with the sound coming in, as a level check. Thick is loud.
-            let (r, g, b) = crate::theme::color(key, fallback);
-            let level = to_meter(source.recent_peak(4));
-            // The big meters keep their top strip for the caption; the line
-            // grows inside the space below it and never reaches the text.
-            let (top, bottom) = if height >= 40.0 {
-                (22.0, height - 4.0)
-            } else {
-                (2.0, height - 2.0)
-            };
-            let thickness = 1.0 + level * (bottom - top - 1.0);
-            cr.set_source_rgba(r, g, b, 0.3 + 0.6 * level);
-            cr.rectangle(0.0, (top + bottom - thickness) / 2.0, width, thickness);
-            let _ = cr.fill();
-            if height >= 40.0 {
-                let ink = area.color();
-                cr.set_source_rgba(
-                    f64::from(ink.red()),
-                    f64::from(ink.green()),
-                    f64::from(ink.blue()),
-                    0.45,
-                );
-                cr.select_font_face(
-                    "sans-serif",
-                    gtk::cairo::FontSlant::Normal,
-                    gtk::cairo::FontWeight::Normal,
-                );
-                cr.set_font_size(12.0);
-                let text = "Not recording";
-                let w = cr.text_extents(text).map(|e| e.x_advance()).unwrap_or(0.0);
-                // In the top part, clear of the line at its thickest.
-                cr.move_to((width - w) / 2.0, 15.0);
-                let _ = cr.show_text(text);
-            }
-            return;
-        }
         let levels = frozen.borrow().clone().unwrap_or_else(|| source.levels());
         let dim = if paused { 0.3 } else { 1.0 };
         let mid = height / 2.0;
@@ -4149,6 +4970,7 @@ fn meter_block(name: &str, meter: &gtk::DrawingArea) -> gtk::Box {
 
 #[cfg(test)]
 mod tests {
+    use super::pick_window;
     use super::*;
 
     fn run(lines: usize, partial: bool) -> transcribe::Transcript {
@@ -4248,5 +5070,40 @@ mod tests {
         // A finished run always replaces it, empty or not.
         assert!(!keeps_saved_partial(&run(3, false), true));
         assert!(!keeps_saved_partial(&run(0, false), true));
+    }
+
+    #[test]
+    fn a_resize_goes_to_the_window_it_is_for() {
+        let window = |address: &str, w: i64, focus: i64| serde_json::json!({ "address": address, "pid": 7, "floating": true, "size": [w, 700], "focusHistoryID": focus });
+        let clients = vec![
+            window("0xa", 480, 1),
+            window("0xb", 1100, 0),
+            window("0xc", 480, 2),
+        ];
+        let pick = |size| pick_window(&clients, 7, size).map(|c| c["address"].clone());
+        assert_eq!(pick((1100, 700)), Some("0xb".into()));
+        // Two of that size: the one focused last.
+        assert_eq!(pick((480, 700)), Some("0xa".into()));
+        // Not on screen yet: the focused one.
+        assert_eq!(pick((0, 0)), Some("0xb".into()));
+        assert_eq!(pick_window(&clients, 8, (480, 700)), None);
+    }
+
+    #[test]
+    fn a_new_window_claims_the_address_no_other_window_has() {
+        let window = |address: &str, focus: i64| serde_json::json!({ "address": address, "pid": 7, "floating": true, "focusHistoryID": focus });
+        let clients = vec![window("0xa", 1), window("0xb", 0)];
+        assert_eq!(
+            super::unclaimed_window(&clients, 7, &[]),
+            Some("0xb".into())
+        );
+        assert_eq!(
+            super::unclaimed_window(&clients, 7, &["0xb".into()]),
+            Some("0xa".into())
+        );
+        assert_eq!(
+            super::unclaimed_window(&clients, 7, &["0xa".into(), "0xb".into()]),
+            None
+        );
     }
 }

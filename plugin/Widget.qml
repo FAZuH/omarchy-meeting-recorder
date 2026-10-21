@@ -2,6 +2,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 
 // Bar widget for Meeting Recorder. While a meeting is being recorded it
@@ -27,8 +28,8 @@ BarWidget {
   readonly property bool shown: recorderState === "recording" || recorderState === "paused"
                                 || recorderState === "stopping"
                                 || recorderState === "transcribing"
-  readonly property color foreground: bar ? bar.barForeground : Color.foreground
-  readonly property color recordColor: Color.urgent
+  readonly property color foreground: bar ? bar.barForeground : Commons.Color.foreground
+  readonly property color recordColor: Commons.Color.urgent
 
   visible: shown
   implicitWidth: shown ? content.implicitWidth + Style.space(14) : 0

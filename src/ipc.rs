@@ -8,8 +8,12 @@
 //!
 //! A line looks like:
 //! {"state":"recording","elapsed":754,"title":"Weekly","mic":0.62,"computer":0.31,"progress":0.0}
-//! with `mic` and `computer` as meter levels from 0 to 1, and `progress` the
-//! transcription progress from 0 to 1 while the state is "transcribing".
+//! with `mic` and `computer` as meter levels from 0 to 1, `progress` the
+//! transcription progress from 0 to 1 while the state is "transcribing", and
+//! `folder` the meeting's folder once it has one ("" before).
+//!
+//! `omarchy-meeting-recorder wait` reads the same lines to wait for a meeting
+//! to be done and print its folder, for scripts and agents.
 
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -35,6 +39,8 @@ pub struct Status {
     pub pause_began: i64,
     pub title: String,
     pub progress: f64,
+    /// The meeting's folder, once it has one.
+    pub folder: String,
 }
 
 pub type SharedStatus = Arc<Mutex<Status>>;
@@ -77,8 +83,22 @@ pub fn now() -> i64 {
         .unwrap_or(0)
 }
 
-/// Commands a client may send, one per line.
-pub const COMMANDS: [&str; 5] = ["start", "stop", "compact", "pause", "new-window"];
+/// Commands a client may send, one per line. `start` may be followed by a
+/// space and the meeting's name, `notes` by the path of a notes file, and
+/// `name` by a name for the meeting about to be recorded.
+pub const COMMANDS: [&str; 7] = [
+    "name",
+    "start",
+    "stop",
+    "compact",
+    "pause",
+    "new-window",
+    "notes",
+];
+
+/// A command from a client, and what came with it: the name for `start`, the
+/// notes file's path for `notes` ("" without).
+pub type Command = (&'static str, String);
 
 /// Starts the socket server. Called once, from the primary instance. Clients
 /// get the state lines of the busiest window; a line a client writes that
@@ -87,7 +107,7 @@ pub fn serve(
     statuses: Statuses,
     mic: Source,
     system: Source,
-    commands: async_channel::Sender<&'static str>,
+    commands: async_channel::Sender<Command>,
 ) {
     let path = socket_path();
     // A socket file left behind by a crash refuses new binds; nobody answers on it.
@@ -137,6 +157,7 @@ pub fn serve(
                 "mic": round(to_meter(mic.recent_peak(3))),
                 "computer": round(to_meter(system.recent_peak(3))),
                 "progress": round(snapshot.progress),
+                "folder": snapshot.folder,
             })
             .to_string()
                 + "\n";
@@ -159,7 +180,7 @@ pub fn serve(
     });
 }
 
-fn read_commands(stream: UnixStream, commands: &async_channel::Sender<&'static str>) {
+fn read_commands(stream: UnixStream, commands: &async_channel::Sender<Command>) {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     loop {
@@ -167,12 +188,59 @@ fn read_commands(stream: UnixStream, commands: &async_channel::Sender<&'static s
         match reader.by_ref().take(MAX_LINE as u64).read_line(&mut line) {
             Ok(0) | Err(_) => return,
             Ok(_) => {
-                if let Some(command) = COMMANDS.iter().find(|c| **c == line.trim()) {
+                if let Some(command) = parse_command(&line) {
                     let _ = commands.send_blocking(command);
                 }
             }
         }
     }
+}
+
+fn parse_command(line: &str) -> Option<Command> {
+    let line = line.trim();
+    let (name, title) = match line.split_once(' ') {
+        Some(("start", title)) => ("start", title.trim()),
+        Some(("notes", path)) => ("notes", path.trim()),
+        Some(("name", title)) => ("name", title.trim()),
+        _ => (line, ""),
+    };
+    COMMANDS
+        .iter()
+        .find(|c| **c == name)
+        .map(|c| (*c, title.to_owned()))
+}
+
+/// `omarchy-meeting-recorder start "Weekly"`: the line that starts a recording
+/// with that name. Whitespace is collapsed, so a name can never add a line.
+pub fn start_line(title: &[String]) -> String {
+    let title = title
+        .iter()
+        .flat_map(|word| word.split_whitespace())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if title.is_empty() {
+        "start".to_owned()
+    } else {
+        format!("start {title}")
+    }
+}
+
+/// `--name <name>`: the line that names the meeting about to be
+/// recorded, without starting it. None without a name.
+pub fn name_line(title: &[String]) -> Option<String> {
+    let title = title
+        .iter()
+        .flat_map(|word| word.split_whitespace())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!title.is_empty()).then(|| format!("name {title}"))
+}
+
+/// `omarchy-meeting-recorder --notes <file>`: the line that opens those notes.
+/// None for a path that would add a line.
+pub fn notes_line(path: &std::path::Path) -> Option<String> {
+    let path = path.to_str()?;
+    (!path.contains('\n') && !path.trim().is_empty()).then(|| format!("notes {path}"))
 }
 
 /// `omarchy-meeting-recorder stop`: ask the running app to stop recording.
@@ -181,6 +249,53 @@ pub fn send(command: &str) -> bool {
         Ok(mut stream) => stream.write_all(format!("{command}\n").as_bytes()).is_ok(),
         Err(_) => false,
     }
+}
+
+/// `omarchy-meeting-recorder wait [--audio]`: waits until the meeting that
+/// is being recorded is done and prints its folder. With `audio_only` it is
+/// back as soon as the audio is saved, before the transcript. Started before
+/// the recorder, it waits for it. False when the recorder closes before the
+/// meeting is done.
+pub fn wait(audio_only: bool) -> bool {
+    let mut busy = false;
+    loop {
+        let Ok(stream) = UnixStream::connect(socket_path()) else {
+            if busy {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(500));
+            continue;
+        };
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.by_ref().take(MAX_LINE as u64).read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let Ok(status) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let state = status["state"].as_str().unwrap_or_default();
+            let folder = status["folder"].as_str().unwrap_or_default();
+            if let Some(done) = finished(state, folder, busy, audio_only) {
+                println!("{done}");
+                return true;
+            }
+            busy |= matches!(state, "recording" | "paused" | "stopping" | "transcribing");
+        }
+    }
+}
+
+/// The folder to print once the meeting `wait` waits for is far enough along.
+fn finished<'a>(state: &str, folder: &'a str, busy: bool, audio_only: bool) -> Option<&'a str> {
+    let far_enough = match state {
+        "done" => busy,
+        "transcribing" => audio_only,
+        _ => false,
+    };
+    (far_enough && !folder.is_empty()).then_some(folder)
 }
 
 fn round(value: f64) -> f64 {
@@ -231,6 +346,63 @@ mod tests {
             title: title.into(),
             ..Default::default()
         }))
+    }
+
+    #[test]
+    fn start_may_carry_a_name() {
+        assert_eq!(parse_command("start\n"), Some(("start", String::new())));
+        assert_eq!(
+            parse_command("start  Product Review \n"),
+            Some(("start", "Product Review".into()))
+        );
+        assert_eq!(parse_command("stop\n"), Some(("stop", String::new())));
+        // Only start takes a name.
+        assert_eq!(parse_command("stop now\n"), None);
+        assert_eq!(parse_command("starting\n"), None);
+    }
+
+    #[test]
+    fn notes_can_name_the_meeting() {
+        let args = ["Voice-over\nstop".to_owned(), " prioriteit ".to_owned()];
+        assert_eq!(
+            name_line(&args).as_deref(),
+            Some("name Voice-over stop prioriteit")
+        );
+        assert_eq!(name_line(&[]), None);
+        assert_eq!(
+            parse_command("name Voice-over prioriteit\n"),
+            Some(("name", "Voice-over prioriteit".into()))
+        );
+    }
+
+    #[test]
+    fn notes_take_a_path() {
+        assert_eq!(
+            parse_command("notes /tmp/a script.md\n"),
+            Some(("notes", "/tmp/a script.md".into()))
+        );
+        let path = std::path::Path::new("/tmp/a script.md");
+        assert_eq!(notes_line(path).as_deref(), Some("notes /tmp/a script.md"));
+        assert_eq!(notes_line(std::path::Path::new("/tmp/a\nstop")), None);
+    }
+
+    #[test]
+    fn wait_prints_the_folder_once_the_meeting_is_done() {
+        let folder = "/home/me/Documents/Meetings/202610131549 Voice-over";
+        assert_eq!(finished("done", folder, true, false), Some(folder));
+        assert_eq!(finished("transcribing", folder, true, false), None);
+        assert_eq!(finished("transcribing", folder, true, true), Some(folder));
+        // A meeting that was already done before waiting began is not the one.
+        assert_eq!(finished("done", folder, false, false), None);
+        assert_eq!(finished("done", "", true, false), None);
+    }
+
+    #[test]
+    fn a_name_cannot_add_a_command() {
+        let args = ["Weekly\nstop".to_owned(), " sync ".to_owned()];
+        assert_eq!(start_line(&args), "start Weekly stop sync");
+        assert_eq!(start_line(&[]), "start");
+        assert_eq!(start_line(&[" ".to_owned()]), "start");
     }
 
     #[test]

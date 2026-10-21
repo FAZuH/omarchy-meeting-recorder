@@ -11,9 +11,8 @@ use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use gtk::glib;
@@ -26,28 +25,26 @@ use crate::audio::{CHANNELS, RATE};
 
 pub const WHISPER_RATE: usize = 16_000;
 
-/// Every language whisper can transcribe, Auto-detect first, then the rest by
+/// (code, label) in the order of the dropdown. "auto" lets whisper detect it.
+const BUILT_IN_LANGUAGES: [(&str, &str); 8] = [
+    ("auto", "Auto-detect"),
+    ("en", "English"),
+    ("nl", "Dutch"),
+    ("de", "German"),
+    ("fr", "French"),
+    ("es", "Spanish"),
+    ("it", "Italian"),
+    ("pt", "Portuguese"),
+];
+
+/// Every language whisper can transcribe, Auto-detect first, then the built-in
+/// ones, then the ones the config names, then the rest of whisper's table by
 /// name. Asked of whisper rather than kept here: its table is the one the
 /// transcription itself looks the code up in. Built once — the language rows
 /// are matched to each other by index, so they must be looking at one list.
 pub fn languages() -> &'static [(&'static str, String)] {
     &LANGUAGES
 }
-
-static LANGUAGES: LazyLock<Vec<(&'static str, String)>> = LazyLock::new(|| {
-    let mut named: Vec<(&str, String)> = (0..=whisper_rs::get_lang_max_id())
-        .filter_map(|id| {
-            Some((
-                whisper_rs::get_lang_str(id)?,
-                titled(whisper_rs::get_lang_str_full(id)?),
-            ))
-        })
-        .collect();
-    named.sort_by(|a, b| a.1.cmp(&b.1));
-    let mut out = vec![("auto", "Auto-detect".to_owned())];
-    out.extend(named);
-    out
-});
 
 /// Whether whisper would take this code. "auto" is how the app spells
 /// Auto-detect, which whisper means with id -1 — and it accepts -1 for *any*
@@ -76,6 +73,90 @@ fn titled(name: &str) -> String {
         .next()
         .map(|c| c.to_uppercase().collect::<String>() + chars.as_str())
         .unwrap_or_default()
+}
+
+/// The dropdown's languages: the built-in ones, then the ones added with
+/// `languages = ["th", "ja"]` in config.toml, then every other language
+/// whisper knows. Read once, when the app starts.
+pub static LANGUAGES: LazyLock<Vec<(&'static str, String)>> = LazyLock::new(|| {
+    let text = std::fs::read_to_string(crate::models::config_file()).unwrap_or_default();
+    with_configured_languages(&text)
+});
+
+fn with_configured_languages(config: &str) -> Vec<(&'static str, String)> {
+    let mut languages: Vec<(&'static str, String)> = BUILT_IN_LANGUAGES
+        .iter()
+        .map(|(code, label)| (*code, (*label).to_owned()))
+        .collect();
+    for name in configured_languages(config) {
+        // whisper knows a language by its code or its English name; the code
+        // is what is stored, so "Thai" and "th" end up the same.
+        let Some(code) =
+            whisper_rs::get_lang_id(&name.to_lowercase()).and_then(whisper_rs::get_lang_str)
+        else {
+            eprintln!("{APP_NAME}: unknown language {name:?} in config.toml, skipped");
+            continue;
+        };
+        if !languages.iter().any(|(c, _)| *c == code) {
+            languages.push((code, whisper_label(code).unwrap_or_else(|| code.to_owned())));
+        }
+    }
+    // The rest of whisper's table, by name: the built-in ones and the
+    // configured ones are already in the list.
+    let mut named: Vec<(&'static str, String)> = (0..=whisper_rs::get_lang_max_id())
+        .filter_map(|id| {
+            Some((
+                whisper_rs::get_lang_str(id)?,
+                titled(whisper_rs::get_lang_str_full(id)?),
+            ))
+        })
+        .collect();
+    named.sort_by(|a, b| a.1.cmp(&b.1));
+    for (code, label) in named {
+        if !languages.iter().any(|(c, _)| *c == code) {
+            languages.push((code, label));
+        }
+    }
+    languages
+}
+
+/// The `languages` array of a config file, on one line or spread over
+/// several. A line format like the rest of config.toml, not a TOML parser.
+fn configured_languages(config: &str) -> Vec<String> {
+    let mut lines = config.lines();
+    let Some(mut value) = lines.find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        (key.trim() == "languages").then(|| uncomment(value).to_owned())
+    }) else {
+        return Vec::new();
+    };
+    if value.trim_start().starts_with('[') {
+        for line in lines {
+            if value.contains(']') {
+                break;
+            }
+            value.push(',');
+            value.push_str(uncomment(line));
+        }
+    }
+    value
+        .split(['[', ']', ','])
+        .map(|name| name.trim().trim_matches(|c| c == '"' || c == '\'').trim())
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn uncomment(line: &str) -> &str {
+    line.split('#').next().unwrap_or("")
+}
+
+/// whisper's English name of a language, capitalized: "th" is "Thai".
+fn whisper_label(code: &str) -> Option<String> {
+    let full = whisper_rs::get_lang_id(code).and_then(whisper_rs::get_lang_str_full)?;
+    let mut chars = full.chars();
+    let first = chars.next()?;
+    Some(first.to_uppercase().collect::<String>() + chars.as_str())
 }
 
 /// What the transcription reports while it runs.
@@ -359,7 +440,9 @@ struct Region {
 
 const FRAME: usize = WHISPER_RATE * 30 / 1000;
 
-/// Frames of `track` with sound in them: above four times its own noise floor.
+/// Frames of `track` with sound in them: above four times its own noise
+/// floor. The other side, imports and the echo check keep this fixed bar;
+/// only your mic gets `adaptive_frames` (#27).
 fn active_frames(track: &[f32], frames: usize) -> Vec<bool> {
     let energies: Vec<f32> = track.chunks(FRAME).map(rms).collect();
     let mut active = vec![false; frames];
@@ -370,6 +453,32 @@ fn active_frames(track: &[f32], frames: usize) -> Vec<bool> {
     sorted.sort_by(f32::total_cmp);
     let floor = sorted[sorted.len() / 10];
     let threshold = (floor * 4.0).max(0.002);
+    for (i, energy) in energies.iter().enumerate().take(frames) {
+        if *energy >= threshold {
+            active[i] = true;
+        }
+    }
+    active
+}
+
+/// Frames of `track` with sound in them: above its own noise floor by a
+/// third of the way up to its speech level, between 3 dB and 12 dB (four
+/// times). A clean track keeps the 12 dB; on a noisy mic, where speech stands
+/// only 10 to 15 dB over the floor, a fixed 12 dB dropped most of the speech
+/// (#27; the bench's `noisy-mic`).
+fn adaptive_frames(track: &[f32], frames: usize) -> Vec<bool> {
+    let energies: Vec<f32> = track.chunks(FRAME).map(rms).collect();
+    let mut active = vec![false; frames];
+    if energies.is_empty() {
+        return active;
+    }
+    let mut sorted = energies.clone();
+    sorted.sort_by(f32::total_cmp);
+    let floor = sorted[sorted.len() / 10];
+    let speech = sorted[(sorted.len() * 95 / 100).min(sorted.len() - 1)];
+    let gap_db = 20.0 * (speech.max(1e-9) / floor.max(1e-9)).log10();
+    let margin_db = (gap_db / 3.0).clamp(3.0, 12.0);
+    let threshold = (floor * 10f32.powf(margin_db / 20.0)).max(0.002);
     for (i, energy) in energies.iter().enumerate().take(frames) {
         if *energy >= threshold {
             active[i] = true;
@@ -409,7 +518,7 @@ fn own_speech_regions(mic: &[f32], computer: &[f32]) -> Vec<Region> {
             .collect()
     };
     let (own, other) = (level(mic), level(computer));
-    let mut active = active_frames(mic, frames);
+    let mut active = adaptive_frames(mic, frames);
     for (i, a) in active.iter_mut().enumerate() {
         let loudest = other[i.saturating_sub(AROUND)..(i + AROUND + 1).min(frames)]
             .iter()
@@ -601,6 +710,7 @@ pub fn transcribe(
     // otherwise lose the quieter one. The side of a line is then its track.
     let (mic, computer) = (mix(mic, &[]), mix(computer, &[]));
     let mic_regions = own_speech_regions(&mic, &computer);
+    let loud = active_frames(&mic, mic.len().div_ceil(FRAME));
     let computer_regions = speech_regions(&[&computer], computer.len());
     if mic_regions.is_empty() && computer_regions.is_empty() {
         emit(events, Event::Progress(1.0));
@@ -611,28 +721,35 @@ pub fn transcribe(
     // several people on the other end of the call. On the mic only your own
     // stretches count, so the other side leaking in is not taken for a person
     // in the room.
-    let local = voices(&only(&mic, &mic_regions), events, abort)?;
+    let (local, heard) = voices_heard(&only(&mic, &mic_regions), events, abort)?;
+    // Echo that got past the level check can still come out as a voice of
+    // its own; its lines are dropped after the mic's pass.
+    let (local, echo) = split_echo(
+        local,
+        &active_frames(&computer, computer.len().div_ceil(FRAME)),
+    );
     let remote = voices(&computer, events, abort)?;
     let context = load_whisper(events, abort)?;
 
     let length = |regions: &[Region]| regions.iter().map(|r| r.end - r.start).sum::<usize>();
     let total = (length(&mic_regions) + length(&computer_regions)).max(1) as f64;
     let mut sides = [
-        (&mic, &mic_regions, Speakers::Side("You", local)),
+        (&mic, &mic_regions, Speakers::Side("You", local), echo),
         (
             &computer,
             &computer_regions,
             Speakers::Side("Remote", remote),
+            Vec::new(),
         ),
     ];
     // The side with the most sound first: with "auto" its language counts for both.
-    sides.sort_by_key(|(_, regions, _)| std::cmp::Reverse(length(regions)));
+    sides.sort_by_key(|(_, regions, _, _)| std::cmp::Reverse(length(regions)));
     let mut language = language.to_owned();
     let mut detected = None;
     let mut segments = Vec::new();
     let mut done = 0.0;
     let mut cancelled = false;
-    for (track, regions, speakers) in &sides {
+    for (track, regions, speakers, echo) in &sides {
         if regions.is_empty() {
             continue;
         }
@@ -655,7 +772,20 @@ pub fn transcribe(
                     language = found.clone();
                     detected = Some(found);
                 }
-                segments.extend(lines);
+                let mine = matches!(speakers, Speakers::Side("You", _));
+                segments.extend(
+                    lines
+                        .into_iter()
+                        .filter(|l| {
+                            echo.is_empty()
+                                || crate::diarize::speaker_at(echo, l.start_ms, l.end_ms) == 0
+                        })
+                        .filter(|l| {
+                            !mine
+                                || loud_enough(&loud, l.start_ms, l.end_ms)
+                                || voice_heard(heard.as_deref(), l.start_ms, l.end_ms)
+                        }),
+                );
                 done += share;
             }
             // The sides that finished are the meeting so far, and the only
@@ -755,6 +885,63 @@ fn interleave(mut sentences: Vec<Segment>) -> Vec<Segment> {
     out
 }
 
+/// Splits the voices found on the mic into real ones and echo. Through
+/// speakers the other side reaches the mic, and when it is loud enough to pass
+/// `own_speech_regions` the diarization hears it as one more person in the
+/// room. Such a voice only speaks while the computer audio does: a voice with
+/// most of its speech (60% or more) over computer audio is echo, as long as
+/// another voice on the mic mostly speaks on its own (under 40%), so that a
+/// call over steady music never loses you. Returns the turns of the real
+/// voices, renumbered (empty when one is left), and all turns with speaker 0
+/// for a real voice and 1 for echo (empty when there is no echo).
+fn split_echo(
+    turns: Vec<crate::diarize::Turn>,
+    computer_active: &[bool],
+) -> (Vec<crate::diarize::Turn>, Vec<crate::diarize::Turn>) {
+    let mut spoken = std::collections::BTreeMap::<usize, (i64, i64)>::new();
+    for turn in &turns {
+        let first = ms_to_sample(turn.start_ms) / FRAME;
+        let last = ms_to_sample(turn.end_ms).div_ceil(FRAME);
+        let (all, over) = spoken.entry(turn.speaker).or_default();
+        for frame in first..last {
+            *all += 1;
+            *over += i64::from(computer_active.get(frame).copied().unwrap_or(false));
+        }
+    }
+    let share = |speaker: &usize| {
+        spoken
+            .get(speaker)
+            .map_or(0.0, |(all, over)| *over as f64 / (*all).max(1) as f64)
+    };
+    let is_echo = |t: &crate::diarize::Turn| share(&t.speaker) >= 0.6;
+    if !spoken.keys().any(|s| share(s) < 0.4) || !turns.iter().any(is_echo) {
+        return (turns, Vec::new());
+    }
+    let mask: Vec<crate::diarize::Turn> = turns
+        .iter()
+        .map(|t| crate::diarize::Turn {
+            speaker: usize::from(is_echo(t)),
+            ..t.clone()
+        })
+        .collect();
+    let real: Vec<crate::diarize::Turn> = turns.into_iter().filter(|t| !is_echo(t)).collect();
+    let mut order: Vec<usize> = Vec::new();
+    let real: Vec<crate::diarize::Turn> = real
+        .into_iter()
+        .map(|t| {
+            let speaker = order
+                .iter()
+                .position(|s| *s == t.speaker)
+                .unwrap_or_else(|| {
+                    order.push(t.speaker);
+                    order.len() - 1
+                });
+            crate::diarize::Turn { speaker, ..t }
+        })
+        .collect();
+    (if order.len() < 2 { Vec::new() } else { real }, mask)
+}
+
 /// `track` with everything outside `regions` silenced.
 fn only(track: &[f32], regions: &[Region]) -> Vec<f32> {
     let mut out = vec![0.0; track.len()];
@@ -772,18 +959,54 @@ fn voices(
     events: &Events,
     abort: &Abort,
 ) -> Result<Vec<crate::diarize::Turn>, String> {
+    Ok(voices_heard(track, events, abort)?.0)
+}
+
+/// `voices`, and where any voice was heard at all: every turn, one speaker
+/// or several (None when that couldn't be told: the model failed).
+#[allow(clippy::type_complexity)]
+fn voices_heard(
+    track: &[f32],
+    events: &Events,
+    abort: &Abort,
+) -> Result<(Vec<crate::diarize::Turn>, Option<Vec<crate::diarize::Turn>>), String> {
     if is_silent(track) {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Some(Vec::new())));
     }
     match crate::diarize::turns(track, None, events, abort) {
-        Ok(turns) if turns.iter().any(|t| t.speaker > 0) => Ok(turns),
-        Ok(_) => Ok(Vec::new()),
+        Ok(turns) if turns.iter().any(|t| t.speaker > 0) => Ok((turns.clone(), Some(turns))),
+        Ok(turns) => Ok((Vec::new(), Some(turns))),
         Err(e) if e == CANCELLED => Err(e),
         Err(e) => {
             eprintln!("{}: telling voices apart: {e}", crate::APP_NAME);
-            Ok(Vec::new())
+            Ok((Vec::new(), None))
         }
     }
+}
+
+/// Whether a line falls where the fixed bar of `active_frames` found sound
+/// too, so the lowered bar did not add it.
+fn loud_enough(loud: &[bool], start_ms: i64, end_ms: i64) -> bool {
+    let (first, last) = (
+        ms_to_sample(start_ms) / FRAME,
+        ms_to_sample(end_ms).div_ceil(FRAME),
+    );
+    loud.get(first..last.min(loud.len()))
+        .is_some_and(|f| f.iter().any(|a| *a))
+}
+
+/// Whether a line of yours falls where the speaker model heard a voice on
+/// your mic. On a mic with no speech the silence gate lets some noise
+/// through, and whisper makes lines up from it; there the speaker model
+/// hears no voice. Kept when the model couldn't tell (None), with a second
+/// of slack at either end.
+fn voice_heard(heard: Option<&[crate::diarize::Turn]>, start_ms: i64, end_ms: i64) -> bool {
+    const SLACK: i64 = 1000;
+    heard.is_none_or(|turns| {
+        turns
+            .iter()
+            .any(|t| t.start_ms < end_ms + SLACK && t.end_ms > start_ms - SLACK)
+    })
 }
 
 /// Transcribes one imported audio file (16 kHz mono) and tells the voices in
@@ -1285,11 +1508,7 @@ fn language_name(code: &str) -> String {
         .iter()
         .find(|(c, _)| *c == code)
         .map(|(_, label)| label.clone())
-        .or_else(|| {
-            whisper_rs::get_lang_id(code)
-                .and_then(whisper_rs::get_lang_str_full)
-                .map(titled)
-        })
+        .or_else(|| whisper_label(code))
         .unwrap_or_else(|| code.to_owned())
 }
 
@@ -1460,6 +1679,72 @@ mod tests {
         }
     }
 
+    /// A track of 30 ms frames at the given RMS levels.
+    fn frames_at(levels: &[f32]) -> Vec<f32> {
+        levels
+            .iter()
+            .flat_map(|level| (0..FRAME).map(move |i| if i % 2 == 0 { *level } else { -*level }))
+            .collect()
+    }
+
+    #[test]
+    fn languages_from_the_config_file_follow_the_built_in_ones() {
+        let config =
+            "model = \"small\"\nlanguages = [\"th\", \"Japanese\", \"en\", \"xx\"] # more\n";
+        let languages = with_configured_languages(config);
+        let added: Vec<(&str, &str)> = languages[BUILT_IN_LANGUAGES.len()..]
+            .iter()
+            .map(|(code, label)| (*code, label.as_str()))
+            .collect();
+        // The configured ones come right after the built-in ones. "en" is
+        // already there, so it is not listed twice, and "xx" is no language.
+        assert_eq!(&added[..2], &[("th", "Thai"), ("ja", "Japanese")]);
+    }
+
+    #[test]
+    fn a_languages_array_can_span_lines() {
+        let config = "languages = [\n  \"th\",  # Thai\n  'ko',\n]\n\n[[action]]\nname = \"x\"\n";
+        assert_eq!(configured_languages(config), ["th", "ko"]);
+    }
+
+    #[test]
+    fn no_languages_in_the_config_file_still_offers_every_language() {
+        let languages = with_configured_languages("");
+        // The built-in ones come first, and then every other language whisper
+        // knows: the list is a superset of the built-in one.
+        assert_eq!(languages.len(), whisper_rs::get_lang_max_id() as usize + 2);
+        for (code, label) in &languages[..BUILT_IN_LANGUAGES.len()] {
+            assert!(
+                BUILT_IN_LANGUAGES
+                    .iter()
+                    .any(|(c, l)| *c == *code && *l == *label),
+                "{code} ({label}) is not one of the built-in languages"
+            );
+        }
+    }
+
+    #[test]
+    fn speech_close_to_a_noisy_floor_still_counts() {
+        // A noisy mic: floor at 0.025 (-32 dBFS), speech at 0.06 (-24 dBFS),
+        // 7.6 dB over it, under the fixed 12 dB.
+        let mut levels = vec![0.025; 80];
+        levels.extend(vec![0.06; 20]);
+        let active = adaptive_frames(&frames_at(&levels), levels.len());
+        assert!(active[..80].iter().all(|a| !a), "the noise stays out");
+        assert!(active[80..].iter().all(|a| *a), "the speech is kept");
+    }
+
+    #[test]
+    fn a_clean_track_keeps_the_full_margin() {
+        // Floor at 0.001, speech at 0.1 (40 dB over): 12 dB, as before.
+        let mut levels = vec![0.001; 80];
+        levels.extend(vec![0.0035; 5]); // 10.9 dB over the floor: not sound
+        levels.extend(vec![0.1; 15]);
+        let active = adaptive_frames(&frames_at(&levels), levels.len());
+        assert!(active[..85].iter().all(|a| !a));
+        assert!(active[85..].iter().all(|a| *a));
+    }
+
     #[test]
     fn every_language_offered_is_one_whisper_accepts() {
         let offered = languages();
@@ -1489,8 +1774,10 @@ mod tests {
 
     #[test]
     fn the_list_is_by_name_with_auto_detect_first() {
-        let offered = languages();
-        let names: Vec<&str> = offered[1..]
+        // The built-in ones come first, in the order the app has always had
+        // them; every other language whisper knows follows, by name.
+        let offered = with_configured_languages("");
+        let names: Vec<&str> = offered[BUILT_IN_LANGUAGES.len()..]
             .iter()
             .map(|(_, label)| label.as_str())
             .collect();
@@ -1530,6 +1817,59 @@ mod tests {
                 "So the beta went out on Monday."
             ]
         );
+    }
+
+    fn turn(start_ms: i64, end_ms: i64, speaker: usize) -> crate::diarize::Turn {
+        crate::diarize::Turn {
+            start_ms,
+            end_ms,
+            speaker,
+        }
+    }
+
+    /// Computer audio in the given ms ranges, as frames.
+    fn computer_audio(ranges: &[(i64, i64)]) -> Vec<bool> {
+        (0..1000)
+            .map(|f| {
+                let ms = sample_to_ms(f * FRAME);
+                ranges.iter().any(|(s, e)| (*s..*e).contains(&ms))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_voice_on_the_mic_that_only_speaks_with_the_other_side_is_echo() {
+        // You speak on your own; the second voice always with the other side.
+        let turns = vec![
+            turn(0, 2000, 0),
+            turn(2000, 4000, 1),
+            turn(4000, 6000, 0),
+            turn(6000, 8000, 1),
+        ];
+        let active = computer_audio(&[(2000, 4000), (6000, 8000)]);
+        let (real, mask) = split_echo(turns, &active);
+        // One voice left: the side is just "You".
+        assert!(real.is_empty());
+        let echo: Vec<usize> = mask.iter().map(|t| t.speaker).collect();
+        assert_eq!(echo, vec![0, 1, 0, 1]);
+    }
+
+    #[test]
+    fn two_people_sharing_the_mic_stay_two() {
+        let turns = vec![turn(0, 2000, 0), turn(2000, 4000, 1), turn(4000, 6000, 0)];
+        let active = computer_audio(&[(6000, 9000)]);
+        let (real, mask) = split_echo(turns.clone(), &active);
+        assert_eq!(real, turns);
+        assert!(mask.is_empty());
+    }
+
+    #[test]
+    fn steady_music_under_the_call_drops_no_one() {
+        let turns = vec![turn(0, 2000, 0), turn(2000, 4000, 1)];
+        let active = computer_audio(&[(0, 9000)]);
+        let (real, mask) = split_echo(turns.clone(), &active);
+        assert_eq!(real, turns);
+        assert!(mask.is_empty());
     }
 
     #[test]
@@ -1577,5 +1917,19 @@ mod tests {
             .map(|s| s.text.as_str())
             .collect();
         assert_eq!(yours, ["The review is still pending, I see."]);
+    }
+
+    #[test]
+    fn lines_of_yours_need_a_voice_heard_on_the_mic() {
+        let heard = vec![crate::diarize::Turn {
+            start_ms: 10_000,
+            end_ms: 14_000,
+            speaker: 0,
+        }];
+        assert!(voice_heard(Some(&heard), 11_000, 12_000));
+        assert!(voice_heard(Some(&heard), 14_500, 16_000));
+        assert!(!voice_heard(Some(&heard), 30_000, 32_000));
+        assert!(!voice_heard(Some(&[]), 0, 1_000));
+        assert!(voice_heard(None, 0, 1_000));
     }
 }

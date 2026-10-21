@@ -1,5 +1,6 @@
 //! Remembered preferences: the audio format, the transcription language,
-//! the name you go by in transcripts and whether the bar widget was offered.
+//! the webcam, the name you go by in transcripts and whether the bar widget
+//! was offered.
 
 use std::path::PathBuf;
 
@@ -60,6 +61,24 @@ pub fn load_language() -> String {
 
 pub fn save_language(code: &str) {
     save("language", code);
+}
+
+/// The camera last recorded with, "" when there was none.
+pub fn load_webcam() -> String {
+    load()["webcam"].as_str().unwrap_or_default().to_owned()
+}
+
+pub fn save_webcam(name: &str) {
+    save("webcam", name);
+}
+
+/// Whether the webcam toggle is on.
+pub fn load_webcam_on() -> bool {
+    load()["webcam_on"].as_str() == Some("yes")
+}
+
+pub fn save_webcam_on(on: bool) {
+    save("webcam_on", if on { "yes" } else { "no" });
 }
 
 /// The name as saved, before the "You" fallback: empty when never set.
