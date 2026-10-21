@@ -24,15 +24,19 @@ build() {
   # target dir. Building elsewhere rebuilds those archives at a new path, and
   # the link then fails with undefined ring_core_* / whisper_rs symbols.
   cd "$HOME/Projects/omarchy/omarchy-meeting-recorder"
+  # mise wraps cargo with that cache; its cached rlibs lose the native
+  # archives, so the package build uses rustup's cargo directly.
+  export PATH="$HOME/.cargo/bin:$PATH"
   # makepkg's CFLAGS reach cargo's build scripts, and ring's bundled crypto then
   # builds without the symbols its Rust half expects. Cargo does not need them.
   export CFLAGS="" CXXFLAGS="" CPPFLAGS="" LDFLAGS=""
-  cargo build --release --locked
+  CARGO_TARGET_DIR="$HOME/.cache/omarchy-meeting-recorder/pkg-target" \
+    cargo build --release --locked
 }
 
 package() {
   cd "$HOME/Projects/omarchy/omarchy-meeting-recorder"
-  install -Dm755 "target/release/omarchy-meeting-recorder" "$pkgdir/usr/bin/omarchy-meeting-recorder"
+  install -Dm755 "$HOME/.cache/omarchy-meeting-recorder/pkg-target/release/omarchy-meeting-recorder" "$pkgdir/usr/bin/omarchy-meeting-recorder"
   install -Dm644 "data/omarchy-meeting-recorder.desktop" "$pkgdir/usr/share/applications/omarchy-meeting-recorder.desktop"
   install -Dm644 "data/omarchy-meeting-recorder.xml" "$pkgdir/usr/share/mime/packages/omarchy-meeting-recorder.xml"
   # The bar widget, linked into ~/.config/omarchy/plugins by the installer.
